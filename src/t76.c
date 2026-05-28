@@ -250,17 +250,31 @@ int t76_begin_transaction(minipro_handle_t *handle)
 		 * to drive memory access; minipro historically sent only 64
 		 * bytes, which makes SPI-NOR reads clock out all zeros.
 		 *
-		 * For SPI 25-series NOR (protocol_id 3 / 0xF) the vendor packs
-		 * (verified by Cynthion USB capture of XGPro V13.19 reading a
-		 * ZB25VQ64A, cross-checked against vendor fn sub_409850):
-		 *   msg[0x40]=0x08000000  msg[0x50]=0x00800000   (read setup)
-		 *   msg[0x60]=<spi-timing dword>  msg[0x65]=0x03  (clock cfg)
-		 * All four are individually load-bearing: dropping any one
-		 * reverts the read to all-zeros. */
+		 * For SPI 25-series NOR (protocol_id 3 / 0xF) the vendor's
+		 * packer (sub_409850) selects a read-setup pair by adapter,
+		 * then writes an SPI-timing dword and a clock-cfg byte. Values
+		 * below are confirmed against real hardware:
+		 *   8-pin  (ZB25VQ64A):   msg[0x40]=0x08000000 msg[0x50]=0x00800000
+		 *   16-pin (MX25L12845E): msg[0x40]=0x00020000 msg[0x50]=0x02000000
+		 *   both:                 msg[0x60]=0x0f05172f msg[0x65]=0x03
+		 * All four are individually load-bearing (dropping any one
+		 * reverts the read to all-zeros). The 8P/16P split is keyed off
+		 * the algorithm/package nibble in `variant >> 8`. TODO: this is
+		 * still adapter/clock-specific (only the standard adapter at
+		 * 16 MHz is confirmed) — generalize from more chips. */
 		if (device->protocol_id == IC2_ALG_SPI25F_1 ||
 		    device->protocol_id == IC2_ALG_SPI25F_2) {
-			format_int(&msg[0x40], 0x08000000, 4, MP_LITTLE_ENDIAN);
-			format_int(&msg[0x50], 0x00800000, 4, MP_LITTLE_ENDIAN);
+			if ((uint8_t)(device->variant >> 8) == SPI_DEVICE_16P) {
+				format_int(&msg[0x40], 0x00020000, 4,
+					   MP_LITTLE_ENDIAN);
+				format_int(&msg[0x50], 0x02000000, 4,
+					   MP_LITTLE_ENDIAN);
+			} else {
+				format_int(&msg[0x40], 0x08000000, 4,
+					   MP_LITTLE_ENDIAN);
+				format_int(&msg[0x50], 0x00800000, 4,
+					   MP_LITTLE_ENDIAN);
+			}
 			format_int(&msg[0x60], 0x0f05172f, 4, MP_LITTLE_ENDIAN);
 			msg[0x65] = 0x03;
 			msglen = 128;
