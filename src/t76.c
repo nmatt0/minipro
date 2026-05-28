@@ -183,7 +183,8 @@ static int t76_send_bitstream(minipro_handle_t *handle)
 
 int t76_begin_transaction(minipro_handle_t *handle)
 {
-	uint8_t msg[64] = { 0 };
+	uint8_t msg[128] = { 0 };
+	size_t msglen = 64;
 	uint8_t ovc;
 	device_t *device = handle->device;
 
@@ -244,7 +245,28 @@ int t76_begin_transaction(minipro_handle_t *handle)
 		/* Algorithm number */
 		msg[63] = (uint8_t)(device->variant >> 8);
 
-		if (msg_send(handle->usb_handle, msg, sizeof(msg)))
+		/* The T76 BEGIN_TRANS is 128 bytes. Bytes 0x40..0x7f carry a
+		 * chip-class geometry / SPI-setup block that the FPGA requires
+		 * to drive memory access; minipro historically sent only 64
+		 * bytes, which makes SPI-NOR reads clock out all zeros.
+		 *
+		 * For SPI 25-series NOR (protocol_id 3 / 0xF) the vendor packs
+		 * (verified by Cynthion USB capture of XGPro V13.19 reading a
+		 * ZB25VQ64A, cross-checked against vendor fn sub_409850):
+		 *   msg[0x40]=0x08000000  msg[0x50]=0x00800000   (read setup)
+		 *   msg[0x60]=<spi-timing dword>  msg[0x65]=0x03  (clock cfg)
+		 * All four are individually load-bearing: dropping any one
+		 * reverts the read to all-zeros. */
+		if (device->protocol_id == IC2_ALG_SPI25F_1 ||
+		    device->protocol_id == IC2_ALG_SPI25F_2) {
+			format_int(&msg[0x40], 0x08000000, 4, MP_LITTLE_ENDIAN);
+			format_int(&msg[0x50], 0x00800000, 4, MP_LITTLE_ENDIAN);
+			format_int(&msg[0x60], 0x0f05172f, 4, MP_LITTLE_ENDIAN);
+			msg[0x65] = 0x03;
+			msglen = 128;
+		}
+
+		if (msg_send(handle->usb_handle, msg, msglen))
 			return EXIT_FAILURE;
 	} else {
 		if (bb_begin_transaction(handle)) {
