@@ -280,6 +280,55 @@ int t76_begin_transaction(minipro_handle_t *handle)
 			msglen = 128;
 		}
 
+		/* Parallel NOR / NAND / eMMC (protocol_id 0x12/0x14) use vendor
+		 * packer sub_4b5a70 for the 0x40..0x7f BEGIN extension. Its
+		 * inputs map to existing fields: chip-family signature =
+		 * package_details (data_7aee14), adapter nibble = variant & 0xf0
+		 * (data_7aede8), geometry select = variant & 0x0f.
+		 *
+		 * Implemented here: the parallel-NOR x16 family (package_details
+		 * low byte 0x0b) with the >=8 geometry branch. Verified
+		 * READ + ERASE bit-correct on an S29GL512N (512 Mbit, TSOP-56,
+		 * adapter nibble 0x50 -> msg[0x48]=0x800). NOTE: parallel-NOR
+		 * *program* (0x11) is still non-functional (needs its own
+		 * per-command descriptor); read and erase work.
+		 * TODO: other families/geometries and NAND/eMMC branches of
+		 * sub_4b5a70 (need more chips + a vendor write capture). */
+		if (device->protocol_id == IC2_ALG_T48 ||
+		    device->protocol_id == IC2_ALG_T40B) {
+			uint8_t family =
+				(uint8_t)device->package_details.packed_package;
+			uint8_t adapter = device->variant & 0xf0;
+			uint8_t geom = device->variant & 0x0f;
+			if (family == 0x0b && geom >= 8) {
+				uint32_t b48;
+				format_int(&msg[0x40], 0x01000000, 4,
+					   MP_LITTLE_ENDIAN);
+				format_int(&msg[0x44], 0x00000040, 4,
+					   MP_LITTLE_ENDIAN);
+				format_int(&msg[0x50], 0x10000000, 4,
+					   MP_LITTLE_ENDIAN);
+				format_int(&msg[0x54], 0x00008000, 4,
+					   MP_LITTLE_ENDIAN);
+				switch (adapter) {
+				case 0x10: b48 = 0x0200; break;
+				case 0x20: b48 = 0x1200; break;
+				case 0x30: b48 = 0x0a00; break;
+				case 0x40: b48 = 0x1000; break;
+				case 0x50: b48 = 0x0800; break;
+				case 0x60: b48 = 0x1800; break;
+				case 0x70: b48 = 0x0400; break;
+				default:   b48 = 0x0800; break;
+				}
+				format_int(&msg[0x48], b48, 4,
+					   MP_LITTLE_ENDIAN);
+				format_int(&msg[0x60], 0x0f05172f, 4,
+					   MP_LITTLE_ENDIAN);
+				msg[0x65] = 0x03;
+				msglen = 128;
+			}
+		}
+
 		if (msg_send(handle->usb_handle, msg, msglen))
 			return EXIT_FAILURE;
 	} else {
