@@ -1387,8 +1387,16 @@ int write_page_ram(minipro_handle_t *handle, uint8_t *buffer, uint8_t type,
 	for (size_t i = 0; i < ds.block_count; i++) {
 		/* Translating address to protocol-specific */
 		ds.address = i * ds.size + offset;
+		/* x16 chips (data_org == WORDS) use word addresses on the
+		 * TL866-era programmers, so the byte address is halved. The
+		 * T76's bulk WRITE_CODE (0x0C) addresses by BYTE, though: the
+		 * per-block address must step by write_buffer_size, not half
+		 * of it. Halving here made consecutive 256-byte blocks land
+		 * 0x80 apart and overlap, ANDing the overlap region (a write
+		 * of 0x91 over 0x11 read back as 0x11). Skip the halving for
+		 * the T76. */
 		if (handle->device->flags.data_org == MP_ORG_WORDS &&
-		    type == MP_CODE) {
+		    type == MP_CODE && handle->version != MP_T76) {
 			ds.address >>= 1;
 		}
 
@@ -2025,6 +2033,29 @@ int write_page_file(minipro_handle_t *handle, uint8_t type, size_t size)
 			size += buffer_size - size_mod;
 	}
 
+	/* The XGPro host unprotects the chip BEFORE erasing it (its
+	 * "Unprotect before programming" option, on by default), in a
+	 * transaction of its own. The T76 firmware needs this ordering for
+	 * protected parallel-NOR parts: unprotecting after the erase (the
+	 * generic path below) is too late and the program silently does
+	 * nothing. Mirror the vendor for the T76 whenever the chip carries
+	 * the off_protect_before flag, regardless of -u. Unprotecting an
+	 * already-unprotected chip is a no-op, so this is safe across T76
+	 * chip classes. */
+	if (handle->version == MP_T76 &&
+	    handle->device->flags.off_protect_before) {
+		if (minipro_protect_off(handle)) {
+			free(file_data);
+			return EXIT_FAILURE;
+		}
+		fprintf(stderr, "Protect off...OK\n");
+		if (minipro_end_transaction(handle) ||
+		    begin_transaction(handle)) {
+			free(file_data);
+			return EXIT_FAILURE;
+		}
+	}
+
 	/* Perform an erase first */
 	if (erase_device(handle)) {
 		free(file_data);
@@ -2041,7 +2072,8 @@ int write_page_file(minipro_handle_t *handle, uint8_t type, size_t size)
 	}
 
 	if (handle->cmdopts->protect_off &&
-	    handle->device->flags.off_protect_before) {
+	    handle->device->flags.off_protect_before &&
+	    handle->version != MP_T76) {
 		if (minipro_protect_off(handle)) {
 			free(file_data);
 			return EXIT_FAILURE;
