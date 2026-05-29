@@ -31,6 +31,7 @@
 #include "t76.h"
 #include "usb.h"
 
+#define T76_BEGIN_TRANS_LOGIC	  0x02 /* 64-byte NAND/logic FPGA-setup prelude */
 #define T76_BEGIN_TRANS		  0x03
 #define T76_END_TRANS		  0x04
 #define T76_READID		  0x05
@@ -53,11 +54,13 @@
 #define T76_PROTECT_ON		  0x19
 #define T76_READ_JEDEC		  0x1D
 #define T76_WRITE_JEDEC		  0x1E
+#define T76_NAND_PROGRAM	  0x1F /* per-block NAND program (init + per-page EP05) */
 #define T76_WRITE_BITSTREAM	  0x26
 #define T76_LOGIC_IC_TEST_VECTOR  0x28
 #define T76_AUTODETECT		  0x37
 #define T76_UNLOCK_TSOP48	  0x38
 #define T76_REQUEST_STATUS	  0x39
+#define T76_NAND_BAD_BLOCK_CHECK  0x3A
 #define T76_BOOTLOADER_WRITE	  0x3B
 #define T76_BOOTLOADER_ERASE	  0x3C
 #define T76_SWITCH		  0x3D
@@ -136,10 +139,21 @@ static int t76_write_bitstream(minipro_handle_t *handle)
 		}
 	}
 
-	/* Send the end of bitstream command */
+	/* Send the end of bitstream command. The vendor puts the size of the
+	 * final (partial) block in msg[2..3] here (e.g. 0x169 = 361 for a
+	 * 775513-byte / 504-chunk bitstream), so the FPGA finalizes the last
+	 * config word. minipro sent 0, which leaves a NAND FPGA mis-finalized
+	 * (READID/read return 0xFF). Carry the real last-block size for NAND.
+	 * TODO: generalize to all T76 chip classes once validated. */
 	memset(msg, 0x00, sizeof(msg));
 	msg[0] = T76_WRITE_BITSTREAM;
 	msg[1] = T76_END_BS;
+	if (handle->device->protocol_id == IC2_ALG_NAND) {
+		size_t last_block = algorithm->length % payload_size;
+		if (last_block == 0)
+			last_block = payload_size;
+		format_int(&msg[2], last_block, 2, MP_LITTLE_ENDIAN);
+	}
 	if (msg_send(handle->usb_handle, msg, 8)) {
 		free(algorithm->bitstream);
 		return EXIT_FAILURE;
@@ -156,6 +170,63 @@ static int t76_write_bitstream(minipro_handle_t *handle)
 }
 
 /* Send the required bitstream algorithm to T76 */
+/* Issue one 0x24 (FPGA register I/O) command. The command word carries the
+ * response length in msg[2..3]; the device returns that many bytes on EP81
+ * which MUST be read back, otherwise the next transfer desyncs (and a
+ * 0xf0 power-down left undrained wedges the device until a USB replug).
+ * Mirrors vendor t76_cmd_24_fpga_register_io @0x455ec0. */
+static int t76_cmd_24(minipro_handle_t *handle, const uint8_t cmd[8])
+{
+	uint8_t msg[8], rsp[64];
+	uint16_t recv_len = cmd[2] | ((uint16_t)cmd[3] << 8);
+	memcpy(msg, cmd, 8);
+	if (msg_send(handle->usb_handle, msg, 8))
+		return EXIT_FAILURE;
+	if (recv_len) {
+		if (recv_len > sizeof(rsp))
+			recv_len = sizeof(rsp);
+		if (msg_recv(handle->usb_handle, rsp, recv_len))
+			return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
+}
+
+/* One-time socket-adapter power/init at session start. XGPro detects and
+ * ENERGIZES the adapter via this 0x24 sequence before any chip op; the BGA
+ * NAND adapter needs it (without it the NAND is never selected -> READID
+ * reads 0xFF and the data read gets no EP82 data). Power-down (drains 8),
+ * read-adapter-ID (drains 0x30), power-up. Bytes replayed from the read5
+ * capture (W29N02GZ). TODO: derive from t76_adapter_detect @0x455670 /
+ * t76_adapter_compat_check @0x455bd0 rather than hardcoding, and validate
+ * the returned adapter ID. */
+static int t76_adapter_init(minipro_handle_t *handle)
+{
+	static const uint8_t pwr_down[8] = { 0x24, 0xf0, 0x08, 0x00,
+					     0x01, 0x00, 0x00, 0x00 };
+	static const uint8_t read_id[8]  = { 0x24, 0xe4, 0x30, 0x00,
+					     0x11, 0x01, 0x08, 0x00 };
+	static const uint8_t pwr_up[8]   = { 0x24, 0xf1, 0x00, 0x00,
+					     0x00, 0x00, 0x00, 0x00 };
+	if (t76_cmd_24(handle, pwr_down) || t76_cmd_24(handle, read_id) ||
+	    t76_cmd_24(handle, pwr_up))
+		return EXIT_FAILURE;
+
+	/* Pin detection (0x3e, 16-byte T76 form), run twice like XGPro right
+	 * after adapter power-up and before the bitstream. On the T76 this
+	 * configures the socket pin drivers for the selected package; without
+	 * it the NAND lines are never driven and the chip reads as an open bus
+	 * (0xFF). Returns a 32-byte bad-pin bitmask which we drain. */
+	for (int i = 0; i < 2; i++) {
+		uint8_t pd[16] = { 0 }, rsp[32];
+		pd[0] = T76_PIN_DETECTION;
+		if (msg_send(handle->usb_handle, pd, sizeof(pd)))
+			return EXIT_FAILURE;
+		if (msg_recv(handle->usb_handle, rsp, sizeof(rsp)))
+			return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
+}
+
 static int t76_send_bitstream(minipro_handle_t *handle)
 {
 	/* Don't upload the bitstream again if we are in the same session */
@@ -166,6 +237,12 @@ static int t76_send_bitstream(minipro_handle_t *handle)
 	* Logic chips are not handled here
 	*/
 	device_t *device = handle->device;
+
+	/* NAND: energize/init the socket adapter before the first bitstream. */
+	if (device->protocol_id == IC2_ALG_NAND) {
+		if (t76_adapter_init(handle))
+			return EXIT_FAILURE;
+	}
 
 	if (get_algorithm(device, MP_T76, handle->cmdopts->algo_path,
 			  handle->cmdopts->icsp, handle->cmdopts->vopt))
@@ -329,6 +406,107 @@ int t76_begin_transaction(minipro_handle_t *handle)
 			}
 		}
 
+		/* NAND (protocol_id 0x2d): the FPGA algorithm bitstream drives
+		 * the NAND command/address bus, so there is NO 0x40..0x5f
+		 * geometry block (the vendor's chip-family signature is 0 here,
+		 * so no BEGIN packer fires). The only required extension bytes
+		 * are the clock/timing dword and its cfg byte, plus the 128-byte
+		 * length. Values from a Cynthion capture of XGPro reading a
+		 * W29N02GZ (pcaps/read5): msg[0x60]=0x0b09272f (a lower clock
+		 * tier than SPI/NOR's 0x0f05172f), msg[0x65]=0x03. */
+		if (device->protocol_id == IC2_ALG_NAND) {
+			/* The NAND read engine needs the per-block transfer
+			 * size (data + spare) at msg[0x10], NOT the total chip
+			 * size, so it streams exactly one block per 0x0d. Also
+			 * set the NAND flag bit 0x800 in raw_flags (vendor
+			 * post-load adjustment). Matches the read5 capture. */
+			if (device->pages_per_block)
+				format_int(&msg[16],
+					   (uint32_t)device->write_buffer_size *
+						   device->pages_per_block,
+					   4, MP_LITTLE_ENDIAN);
+			format_int(&msg[56],
+				   device->flags.raw_flags | 0x800, 4,
+				   MP_LITTLE_ENDIAN);
+			format_int(&msg[0x60], 0x0b09272f, 4,
+				   MP_LITTLE_ENDIAN);
+			msg[0x65] = 0x03;
+			/* Remaining bytes that differ from the vendor BEGIN
+			 * (read5): forced to match byte-for-byte while we
+			 * determine which are load-bearing for the NAND read.
+			 * 0x28 is the NAND pin/family byte (0xe2 in V13.19 DB
+			 * vs minipro's stale 0x22); 0x0e/0x14/0x18/0x1c/0x30
+			 * are voltage/reserved fields. TODO: source these
+			 * properly (DB refresh / derive) once ablated. */
+			msg[0x0e] = 0x20;
+			msg[0x14] = 0x00;
+			msg[0x18] = 0x03;
+			msg[0x1c] = 0x03;
+			format_int(&msg[0x28], 0xe2000000, 4,
+				   MP_LITTLE_ENDIAN);
+			msg[0x30] = 0x40;
+			msglen = 128;
+
+			/* NAND chips register as chip_type 0x2d, which makes the
+			 * vendor emit a 64-byte opcode-0x02 "logic begin" prelude
+			 * immediately BEFORE the 0x03 BEGIN_TRANS (vendor packer
+			 * site t76_begin_transaction_full @ 0x443322). This prelude
+			 * programs the FPGA's NAND page/block geometry and bus clock;
+			 * without it the FPGA never clocks the NAND, so READID returns
+			 * 00 FF FF and the first 0x0d read times out. minipro
+			 * historically skipped it (confirmed by a same-machine USBPcap
+			 * diff of minipro.exe vs XGPro on a W29N02GZ, 2026-05-29).
+			 *
+			 * Field map (vendor packer, the chip_type==0x2d block ending
+			 * at the usb_msg_send_ep01 of 0x40 bytes @ 0x443322):
+			 *   [0x00]   = 0x02 opcode
+			 *   [0x08].w = data_7a5cc0 = pages_per_block
+			 *   [0x0a].w = data_7a5cc2 = page_size (the value the
+			 *              page-size-code switch keys off)
+			 *   [0x0c].w = data_7a5cc4 = page_size
+			 *   [0x0e].w = data_7a5cc6 = pages_per_block
+			 *   [0x10].w = data_7a5cc8 } plane/LUN counts (1/1 for the
+			 *   [0x12].w = data_7a5cca }  single-die W29N02GZ)
+			 *   [0x14].d = data_7a5ccc = bus/width code (3)
+			 *   [0x18].d = page-size code: <2048->4, ==2048->8,
+			 *              ==4096->4, ==16384->1, else->2
+			 *   [0x1c].d = (data_7a5cdc != 0) -> 0 here
+			 *   [0x20].d = data_7a5cd4 (adapter-mode byte at +2 = 1)
+			 *   [0x24].d = NAND bus clock, table[data_80dc6c & 7]
+			 * Geometry comes straight from the device profile; the
+			 * plane/width/mode/clock fields are programmer-fixed and kept
+			 * as documented constants from the W29N02GZ capture (only one
+			 * NAND part validated so far). Confirmed: with this prelude
+			 * READID returns the real 0xEFAA and the full 264 MiB array
+			 * reads back deterministically (md5 22a14421...); without it
+			 * the FPGA never clocks the NAND (READID 00 FF FF, 0x0d
+			 * timeout). TODO: validate plane/width/clock on more NAND
+			 * parts and source the clock from the bus-clock table. */
+			{
+				uint8_t pre[64] = { 0 };
+				uint16_t ps = (uint16_t)device->page_size;
+				uint16_t ppb = device->pages_per_block;
+				uint32_t ps_code = (ps < 0x800)   ? 4 :
+						   (ps == 0x800)  ? 8 :
+						   (ps == 0x1000) ? 4 :
+						   (ps == 0x4000) ? 1 :
+								    2;
+				pre[0] = T76_BEGIN_TRANS_LOGIC; /* 0x02 */
+				format_int(&pre[0x08], ppb, 2, MP_LITTLE_ENDIAN);
+				format_int(&pre[0x0a], ps, 2, MP_LITTLE_ENDIAN);
+				format_int(&pre[0x0c], ps, 2, MP_LITTLE_ENDIAN);
+				format_int(&pre[0x0e], ppb, 2, MP_LITTLE_ENDIAN);
+				format_int(&pre[0x10], 1, 2, MP_LITTLE_ENDIAN);
+				format_int(&pre[0x12], 1, 2, MP_LITTLE_ENDIAN);
+				format_int(&pre[0x14], 3, 4, MP_LITTLE_ENDIAN);
+				format_int(&pre[0x18], ps_code, 4, MP_LITTLE_ENDIAN);
+				format_int(&pre[0x20], 0x00010000, 4, MP_LITTLE_ENDIAN);
+				format_int(&pre[0x24], 0x27154f3b, 4, MP_LITTLE_ENDIAN);
+				if (msg_send(handle->usb_handle, pre, sizeof(pre)))
+					return EXIT_FAILURE;
+			}
+		}
+
 		if (msg_send(handle->usb_handle, msg, msglen))
 			return EXIT_FAILURE;
 	} else {
@@ -377,6 +555,31 @@ int t76_read_block(minipro_handle_t *handle, data_set_t *ds)
 	if (handle->device->flags.custom_protocol) {
 		return bb_read_block(handle, ds->type, ds->address, ds->data,
 				     ds->size);
+	}
+
+	/* NAND read: one erase-block (data + spare) per command. The vendor
+	 * (XGPro V13.19) issues a 0x0d per block with the 16-bit block index in
+	 * msg[2..3] and a fixed NAND read-parameter header in msg[4..0xf]
+	 * (captured from a W29N02GZ read, pcaps/read5). The whole block is then
+	 * streamed raw on EP82. ds->size is set to the block-with-spare size by
+	 * read_page_ram, and ds->address steps by ds->size, so block index =
+	 * ds->address / ds->size.
+	 * TODO: the fixed header (msg[4..0xf]) is replayed verbatim; derive it
+	 * from the read-param setup (vendor sub_4f1fc0) instead of hardcoding. */
+	if (handle->device->protocol_id == IC2_ALG_NAND && ds->type == MP_CODE) {
+		uint8_t msg[16] = { 0 };
+		static const uint8_t nand_read_hdr[12] = {
+			0x10, 0x00, 0x04, 0x00, /* msg[4..7]  */
+			0x08, 0x00, 0x08, 0x00, /* msg[8..b]  */
+			0x69, 0x01, 0x00, 0x00, /* msg[c..f]  */
+		};
+		uint32_t block_index = ds->size ? (ds->address / ds->size) : 0;
+		msg[0] = T76_READ_CODE;
+		format_int(&msg[2], block_index, 2, MP_LITTLE_ENDIAN);
+		memcpy(&msg[4], nand_read_hdr, sizeof(nand_read_hdr));
+		if (msg_send(handle->usb_handle, msg, 16))
+			return EXIT_FAILURE;
+		return read_payload(handle->usb_handle, ds->data, ds->size);
 	}
 
 	uint8_t msg[64] = { 0 };
@@ -452,6 +655,76 @@ int t76_write_block(minipro_handle_t *handle, data_set_t *ds)
 	if (handle->device->flags.custom_protocol) {
 		return bb_write_block(handle, ds->type, ds->address, ds->data,
 				      ds->size);
+	}
+
+	/* NAND program (protocol_id 0x2d). The vendor T76 path (sub_4cf2c0)
+	 * does NOT use the bulk 0x0C WRITE_CODE: it sends a per-block init with
+	 * opcode 0x1F, then streams each page (page+spare) as a separate
+	 * EP05 packet prefixed by a 16-byte header, reading a 0x20-byte status
+	 * from EP83 after each page. read_page_ram/write_page_ram feed one
+	 * erase-block (write_buffer_size * pages_per_block) per call here, so
+	 * ds->data holds the whole block (pages interleaved with their spare,
+	 * exactly as t76_read_block returns it) and block index =
+	 * ds->address / ds->size.
+	 *   Init (0x1F, 16B): msg[2..3]=page+spare, msg[4..7]=block,
+	 *                     msg[8..b]=pages_per_block, msg[0xc..0xf]=page+spare.
+	 *   Per page: [16B hdr (hdr[0]=0x1F) | page+spare] -> EP05.
+	 *   Commit:   a plain 0x39 REQUEST_STATUS after the 64 pages.
+	 *
+	 * The firmware cache-programs: page N commits when page N+1's data
+	 * arrives, so the block's LAST page (63) is left pending. The 0x39 poll
+	 * after the page stream waits for that final program to complete (and
+	 * returns block status), then the next block's 0x1F init follows. Without
+	 * the 0x39, page 63 of every block reads back erased (observed). Confirmed
+	 * by a capture of XGPro programming this part (pcaps/xgpro-2): per block it
+	 * is 0x1F init, 64x EP05 page writes, then a plain `39 00..` (8B) before
+	 * the next 0x1F. The EP83 reads the vendor also posts are overlapped and
+	 * aborted (complete with 0 bytes) — telemetry, NOT the commit mechanism.
+	 *
+	 * NOTE: no host-side ECC here — the image is written raw (data+spare as
+	 * read back), matching a raw read/restore. ECC-managed writes (vendor
+	 * NandDLL) are a separate future path. */
+	if (handle->device->protocol_id == IC2_ALG_NAND && ds->type == MP_CODE) {
+		device_t *device = handle->device;
+		uint16_t page_full = device->write_buffer_size;
+		uint16_t ppb = device->pages_per_block;
+		uint32_t block_index = ds->size ? (ds->address / ds->size) : 0;
+		uint8_t imsg[16] = { 0 };
+
+		imsg[0] = T76_NAND_PROGRAM;
+		format_int(&imsg[2], page_full, 2, MP_LITTLE_ENDIAN);
+		format_int(&imsg[4], block_index, 4, MP_LITTLE_ENDIAN);
+		format_int(&imsg[8], ppb, 4, MP_LITTLE_ENDIAN);
+		format_int(&imsg[12], page_full, 4, MP_LITTLE_ENDIAN);
+		if (msg_send(handle->usb_handle, imsg, 16))
+			return EXIT_FAILURE;
+
+		uint8_t *pkt = malloc((size_t)page_full + 16);
+		if (!pkt) {
+			fprintf(stderr, "Out of memory!\n");
+			return EXIT_FAILURE;
+		}
+		for (uint32_t p = 0; p < ppb; p++) {
+			memset(pkt, 0, 16);
+			pkt[0] = T76_NAND_PROGRAM;
+			memcpy(pkt + 16, ds->data + (size_t)p * page_full,
+			       page_full);
+			if (write_payload(handle->usb_handle, pkt,
+					   (size_t)page_full + 16)) {
+				free(pkt);
+				return EXIT_FAILURE;
+			}
+		}
+		free(pkt);
+
+		/* Commit the block: a plain 0x39 REQUEST_STATUS waits for the
+		 * last page's program to finish and returns block status. */
+		uint8_t st[32] = { 0 };
+		st[0] = T76_REQUEST_STATUS;
+		if (msg_send(handle->usb_handle, st, 8) ||
+		    msg_recv(handle->usb_handle, st, sizeof(st)))
+			return EXIT_FAILURE;
+		return EXIT_SUCCESS;
 	}
 
 	uint8_t msg[64] = { 0 };
@@ -590,6 +863,10 @@ int t76_get_chip_id(minipro_handle_t *handle, uint8_t *type,
 	}
 	uint8_t msg[32] = { 0 }, format, id_length;
 	msg[0] = T76_READID;
+	/* NOTE: XGPro leaves msg[1..7] as uninitialized stack garbage here
+	 * (read5 sent dd ca 01, read7 sent db 11 07 — varies per run, both read
+	 * the real ID), so these bytes are NOT load-bearing. minipro sends them
+	 * zeroed, which is correct. */
 	if (msg_send(handle->usb_handle, msg, 8))
 		return EXIT_FAILURE;
 	if (msg_recv(handle->usb_handle, msg, sizeof(msg)))
@@ -670,11 +947,69 @@ int t76_protect_on(minipro_handle_t *handle)
 	return msg_send(handle->usb_handle, msg, sizeof(msg));
 }
 
+/* NAND erase. The T76 ERASE opcode (0x0E) erases ONE block, selected by the
+ * 16-bit block index in msg[2..3]; a bare 0x0E (index 0) only ever erases
+ * block 0. The vendor (t76_nand_erase_with_bad_block_skip @ 0x4c4e30) loops
+ * over every block, first probing the factory bad-block marker with the 0x3A
+ * check (t76_cmd_3a_nand_check_bad_block @ 0x4c62a6) and SKIPPING flagged
+ * blocks so their markers are preserved, then issuing 0x0E for the rest.
+ *   0x3A: msg[0]=3A, msg[2..3]=block, send 8 / recv 8; resp[1]!=0 => bad.
+ *   0x0E: msg[0]=0E, msg[2..3]=block, send 16 / recv 8; resp[1]!=0 => bad.
+ * Block count = code_memory_size / (write_buffer_size * pages_per_block). */
+static int t76_nand_erase(minipro_handle_t *handle)
+{
+	device_t *device = handle->device;
+	uint8_t msg[64];
+	uint8_t resp[8];
+
+	uint32_t block_size =
+		(uint32_t)device->write_buffer_size * device->pages_per_block;
+	if (!block_size) {
+		fprintf(stderr, "NAND geometry missing (block size 0).\n");
+		return EXIT_FAILURE;
+	}
+	uint32_t block_count = (uint32_t)(device->code_memory_size / block_size);
+	uint32_t bad = 0;
+
+	for (uint32_t blk = 0; blk < block_count; blk++) {
+		/* 0x3A bad-block check: skip factory-marked bad blocks so the
+		 * marker survives the erase. */
+		memset(msg, 0, sizeof(msg));
+		msg[0] = T76_NAND_BAD_BLOCK_CHECK;
+		format_int(&msg[2], blk, 2, MP_LITTLE_ENDIAN);
+		if (msg_send(handle->usb_handle, msg, 8) ||
+		    msg_recv(handle->usb_handle, resp, sizeof(resp)))
+			return EXIT_FAILURE;
+		if (resp[1] != 0) {
+			bad++;
+			continue;
+		}
+
+		/* 0x0E erase this block. */
+		memset(msg, 0, sizeof(msg));
+		msg[0] = T76_ERASE;
+		format_int(&msg[2], blk, 2, MP_LITTLE_ENDIAN);
+		if (msg_send(handle->usb_handle, msg, 16) ||
+		    msg_recv(handle->usb_handle, resp, sizeof(resp)))
+			return EXIT_FAILURE;
+		if (resp[1] != 0)
+			bad++;
+	}
+
+	if (bad)
+		fprintf(stderr, "(%u bad block%s skipped) ", bad,
+			bad == 1 ? "" : "s");
+	return EXIT_SUCCESS;
+}
+
 int t76_erase(minipro_handle_t *handle, uint8_t num_fuses, uint8_t pld)
 {
 	if (handle->device->flags.custom_protocol) {
 		return bb_erase(handle);
 	}
+
+	if (handle->device->protocol_id == IC2_ALG_NAND)
+		return t76_nand_erase(handle);
 
 	uint8_t msg[64] = { 0 };
 	msg[0] = T76_ERASE;
@@ -693,6 +1028,21 @@ int t76_get_ovc_status(minipro_handle_t *handle, minipro_status_t *status,
 {
 	uint8_t msg[32] = { 0 };
 	msg[0] = T76_REQUEST_STATUS;
+	/* For NAND the vendor reuses the BEGIN buffer for the 0x39 status poll,
+	 * leaving the chip-parameter header in msg[1..7]
+	 * (e.g. 39 2d 00 00 06 00 a0 70). A zeroed 0x39 appears to leave the
+	 * NAND deselected so the following READID/read returns 0xFF. Mirror the
+	 * vendor by repacking the same header for NAND. */
+	if (handle->device->protocol_id == IC2_ALG_NAND) {
+		device_t *device = handle->device;
+		msg[1] = device->protocol_id;
+		msg[2] = (uint8_t)device->variant;
+		msg[3] = handle->cmdopts->icsp;
+		format_int(&msg[4], device->voltages.raw_voltages, 2,
+			   MP_LITTLE_ENDIAN);
+		msg[6] = (uint8_t)device->chip_info;
+		msg[7] = (uint8_t)device->pin_map;
+	}
 	if (msg_send(handle->usb_handle, msg, 8))
 		return EXIT_FAILURE;
 	if (msg_recv(handle->usb_handle, msg, sizeof(msg)))

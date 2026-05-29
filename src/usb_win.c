@@ -193,6 +193,12 @@ int msg_recv(void *handle, uint8_t *buffer, size_t size)
 	return usb_read(handle, buffer, size, USB_ENDPOINT_IN | 0x01);
 }
 
+/* Read a status packet from EP83 IN (T76 NAND program per-page status). */
+int status_recv(void *handle, uint8_t *buffer, size_t size)
+{
+	return usb_read(handle, buffer, size, USB_ENDPOINT_IN | 0x03);
+}
+
 /* Write payload asynchronously */
 int write_payload2(void *handle, uint8_t *buffer, size_t length, size_t limit)
 {

@@ -440,3 +440,14 @@ int msg_recv(void *usb_handle, uint8_t *buffer, size_t size)
 	return msg_transfer(usb_handle, buffer, size, LIBUSB_ENDPOINT_IN, 0x01,
 			    &bytes_transferred, MP_USB_READ_TIMEOUT);
 }
+
+/* Read a status packet from EP83 IN. Used by the T76 NAND program flow, which
+ * emits a per-block status word on endpoint 0x83 once the block's last page has
+ * finished programming. Short timeout: the status arrives within a page-program
+ * time, so a missing one should fail fast rather than hang. */
+int status_recv(void *usb_handle, uint8_t *buffer, size_t size)
+{
+	int bytes_transferred;
+	return msg_transfer(usb_handle, buffer, size, LIBUSB_ENDPOINT_IN, 0x03,
+			    &bytes_transferred, MP_USBTIMEOUT);
+}

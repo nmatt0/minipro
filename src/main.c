@@ -1314,6 +1314,18 @@ int read_page_ram(minipro_handle_t *handle, uint8_t *buffer, uint8_t type,
 
 	ds.block_count = (size + ds.size - 1) / ds.size;
 
+	/* NAND (T76) is read one erase-block at a time (data + spare), so the
+	 * transfer unit is write_buffer_size * pages_per_block (e.g. 0x840 *
+	 * 0x40 = 0x21000), not the generic read_buffer_size. Each per-block
+	 * read command carries the block index; see t76_read_block. */
+	if (handle->version == MP_T76 && type == MP_CODE &&
+	    handle->device->protocol_id == IC2_ALG_NAND &&
+	    handle->device->pages_per_block) {
+		ds.size = (size_t)handle->device->write_buffer_size *
+			  handle->device->pages_per_block;
+		ds.block_count = (size + ds.size - 1) / ds.size;
+	}
+
 	/* Some controllers have data memory (eeprom) mapped to a
 	 * different address than 0 in programming mode. For ex. AT89S8252 */
 	uint32_t offset = handle->device->flags.has_data_offset ?
@@ -1328,7 +1340,8 @@ int read_page_ram(minipro_handle_t *handle, uint8_t *buffer, uint8_t type,
 		ds.address = i * ds.size + offset;
 
 		if (handle->device->flags.data_org == MP_ORG_WORDS &&
-		    type == MP_CODE) {
+		    type == MP_CODE &&
+		    handle->device->protocol_id != IC2_ALG_NAND) {
 			ds.address >>= 1;
 		}
 
@@ -1372,6 +1385,18 @@ int write_page_ram(minipro_handle_t *handle, uint8_t *buffer, uint8_t type,
 			  .size = handle->device->write_buffer_size,
 			  .init = 1 };
 	ds.block_count = (size + ds.size - 1) / ds.size;
+
+	/* NAND (T76) is programmed one erase-block at a time (data + spare):
+	 * t76_write_block sends a per-block 0x1F init then streams each page.
+	 * Feed it the block-with-spare size (write_buffer_size * pages_per_block,
+	 * e.g. 0x21000), mirroring read_page_ram. */
+	if (handle->version == MP_T76 && type == MP_CODE &&
+	    handle->device->protocol_id == IC2_ALG_NAND &&
+	    handle->device->pages_per_block) {
+		ds.size = (size_t)handle->device->write_buffer_size *
+			  handle->device->pages_per_block;
+		ds.block_count = (size + ds.size - 1) / ds.size;
+	}
 
 	minipro_status_t status;
 
@@ -3382,7 +3407,7 @@ int main(int argc, char **argv)
 
 	/* Check for unsupported devices */
 	switch (device->chip_type) {
-	case MP_NAND:
+	/* case MP_NAND:  -- temporarily bypassed for T76 NAND read experiment */
 	case MP_EMMC:
 	case MP_VGA:
 		minipro_close(handle);

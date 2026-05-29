@@ -26,6 +26,7 @@ int minipro_get_devices_count(uint8_t version);
 
 int msg_send(void *handle, uint8_t *buffer, size_t size);
 int msg_recv(void *handle, uint8_t *buffer, size_t size);
+int status_recv(void *handle, uint8_t *buffer, size_t size);
 int write_payload2(void *handle, uint8_t *buffer, size_t length, size_t limit);
 static inline int write_payload(void *handle, uint8_t *buffer, size_t length)
 {
