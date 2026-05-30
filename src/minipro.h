@@ -339,6 +339,10 @@ typedef struct minipro_handle {
 	void *usb_handle;
 	cmdopts_t *cmdopts;
 	uint8_t bitstream_uploaded;
+	/* T76 eMMC: real device capacity in bytes, read from EXT_CSD SEC_COUNT
+	 * during begin_transaction (0 = unknown / not eMMC). 64-bit because eMMC
+	 * parts exceed the uint32 code_memory_size range. */
+	uint64_t emmc_capacity;
 
 	int (*minipro_begin_transaction)(struct minipro_handle *);
 	int (*minipro_end_transaction)(struct minipro_handle *);

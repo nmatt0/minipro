@@ -1326,6 +1326,17 @@ int read_page_ram(minipro_handle_t *handle, uint8_t *buffer, uint8_t type,
 		ds.block_count = (size + ds.size - 1) / ds.size;
 	}
 
+	/* eMMC (T76): the vendor streams a region over a single 0x0D read as
+	 * back-to-back 64 KiB (0x10000) blocks on EP82 (capture xgpro-3). Feed
+	 * t76_read_block one 64 KiB block per call; it sends the 0x0D init once
+	 * (with the start LBA and total 64 KiB-block count) then drains one block
+	 * per call. read size must be a multiple of 0x10000. */
+	if (handle->version == MP_T76 && type == MP_CODE &&
+	    handle->device->protocol_id == IC2_ALG_EMMC) {
+		ds.size = 0x10000;
+		ds.block_count = (size + ds.size - 1) / ds.size;
+	}
+
 	/* Some controllers have data memory (eeprom) mapped to a
 	 * different address than 0 in programming mode. For ex. AT89S8252 */
 	uint32_t offset = handle->device->flags.has_data_offset ?
@@ -1344,6 +1355,13 @@ int read_page_ram(minipro_handle_t *handle, uint8_t *buffer, uint8_t type,
 		    handle->device->protocol_id != IC2_ALG_NAND) {
 			ds.address >>= 1;
 		}
+
+		/* eMMC addresses by 512-byte LBA, not byte. A byte address would
+		 * overflow uint32 past 4 GiB; the sector index fits (a 2 TiB part
+		 * is still only 0xFFFFFFFF sectors). */
+		if (handle->version == MP_T76 && type == MP_CODE &&
+		    handle->device->protocol_id == IC2_ALG_EMMC)
+			ds.address = (uint32_t)((uint64_t)i * (ds.size >> 9));
 
 		if (minipro_read_block(handle, &ds))
 			return EXIT_FAILURE;
@@ -1398,6 +1416,14 @@ int write_page_ram(minipro_handle_t *handle, uint8_t *buffer, uint8_t type,
 		ds.block_count = (size + ds.size - 1) / ds.size;
 	}
 
+	/* eMMC (T76): program a region as 64 KiB (0x10000) blocks streamed on
+	 * EP05 after a single 0x1F init (mirrors the read path). */
+	if (handle->version == MP_T76 && type == MP_CODE &&
+	    handle->device->protocol_id == IC2_ALG_EMMC) {
+		ds.size = 0x10000;
+		ds.block_count = (size + ds.size - 1) / ds.size;
+	}
+
 	minipro_status_t status;
 
 	/* Some controllers have data memory (eeprom) mapped to a
@@ -1424,6 +1450,13 @@ int write_page_ram(minipro_handle_t *handle, uint8_t *buffer, uint8_t type,
 		    type == MP_CODE && handle->version != MP_T76) {
 			ds.address >>= 1;
 		}
+
+		/* eMMC: address by 512-byte LBA (sector index), not byte — fits
+		 * uint32 at multi-GiB capacities. Computed from the full chunk
+		 * before any last-block shrink below. */
+		if (handle->version == MP_T76 && type == MP_CODE &&
+		    handle->device->protocol_id == IC2_ALG_EMMC)
+			ds.address = (uint32_t)((uint64_t)i * (ds.size >> 9));
 
 		/* Last block */
 		if ((i + 1) * ds.size > size)
@@ -2880,6 +2913,19 @@ int verify_fuses(minipro_handle_t *handle, fuse_decl_t *fuses)
 	return ret;
 }
 
+/* Code-memory size in bytes for the current device. For a T76 eMMC this is the
+ * real capacity read from EXT_CSD SEC_COUNT during begin_transaction
+ * (handle->emmc_capacity, 64-bit); minipro's grouped infoic.xml carries only a
+ * placeholder code_memory_size for eMMC. Falls back to code_memory_size when the
+ * EXT_CSD read hasn't run or returned 0. */
+static size_t t76_code_size(minipro_handle_t *handle)
+{
+	if (handle->version == MP_T76 &&
+	    handle->device->protocol_id == IC2_ALG_EMMC && handle->emmc_capacity)
+		return (size_t)handle->emmc_capacity;
+	return handle->device->code_memory_size;
+}
+
 /* Higher-level logic */
 int action_read(minipro_handle_t *handle)
 {
@@ -2977,7 +3023,7 @@ int action_read(minipro_handle_t *handle)
 	if (handle->cmdopts->page == CODE ||
 	    handle->cmdopts->page == UNSPECIFIED) {
 		if (read_page_file(handle, MP_CODE,
-				   handle->device->code_memory_size)) {
+				   t76_code_size(handle))) {
 			ret = EXIT_FAILURE;
 			goto end;
 		}
@@ -3177,7 +3223,7 @@ int action_write(minipro_handle_t *handle)
 		case UNSPECIFIED:
 		case CODE:
 			if (write_page_file(handle, MP_CODE,
-					    handle->device->code_memory_size))
+					    t76_code_size(handle)))
 				return EXIT_FAILURE;
 			break;
 		case DATA:
@@ -3307,7 +3353,7 @@ int action_verify(minipro_handle_t *handle)
 			if (begin_transaction(handle))
 				return EXIT_FAILURE;
 			if (verify_page_file(handle, MP_CODE,
-					     handle->device->code_memory_size))
+					     t76_code_size(handle)))
 				ret = EXIT_FAILURE;
 		}
 
@@ -3407,13 +3453,20 @@ int main(int argc, char **argv)
 
 	/* Check for unsupported devices */
 	switch (device->chip_type) {
-	/* case MP_NAND:  -- temporarily bypassed for T76 NAND read experiment */
-	case MP_EMMC:
+	/* case MP_NAND:  -- bypassed: T76 NAND read/erase/program implemented */
+	/* case MP_EMMC:  -- bypassed: T76 eMMC read implemented (first pass) */
 	case MP_VGA:
 		minipro_close(handle);
 		fprintf(stderr, "This chip is not supported yet.\n");
 		return EXIT_FAILURE;
 	}
+
+	/* T76 eMMC: minipro's infoic.xml groups many eMMC parts under one entry
+	 * with a placeholder code_memory_size (0x200) and no real per-chip
+	 * capacity. The true capacity is read from the device's EXT_CSD SEC_COUNT
+	 * during begin_transaction (handle->emmc_capacity, 64-bit) and used by the
+	 * code-size helper t76_emmc_size(); see t76_emmc_bring_up. No static cap
+	 * is applied here anymore. */
 
 	/* Parse programming options */
 	if (parse_options(handle, argc, argv)) {

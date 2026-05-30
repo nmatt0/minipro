@@ -66,6 +66,25 @@
 #define T76_SWITCH		  0x3D
 #define T76_PIN_DETECTION	  0x3E
 
+/* eMMC (protocol_id 0x31). eMMC bus operations are tunneled through opcode
+ * 0x27; FPGA-side host-controller registers are configured through opcode
+ * 0x01. See t76-spec.md §5B and the eMMC RE notes. */
+#define T76_EMMC_IO_REG		  0x01 /* FPGA eMMC/NAND register I/O      */
+#define T76_EMMC_SEND_CMD	  0x27 /* eMMC CMD tunnel (3 forms)        */
+
+/* 0x27 msg[1] "T76 eMMC-op" codes (NOT raw JEDEC CMD indices; the firmware
+ * maps them internally). Only 0x46 (CMD6 SWITCH) is hardware-confirmed. */
+#define T76_EMMC_OP_SWITCH	  0x46 /* CMD6 SWITCH (R1b)                */
+
+/* CMD6 SWITCH args = EXT_CSD[179] PARTITION_CONFIG writes (Access in
+ * bits[25:24], Index 0xB3 in bits[23:16], Value in bits[15:8]). USER/RPMB
+ * are confirmed from the vendor (sub_48e600); BOOT1/BOOT2 are inferred from
+ * the JEDEC partition_access encoding (not located in the vendor binary). */
+#define T76_EMMC_PART_USER	  0x02B30700 /* clear access -> USER        */
+#define T76_EMMC_PART_BOOT1	  0x01B30100 /* set access 001 -> BOOT1     */
+#define T76_EMMC_PART_BOOT2	  0x01B30200 /* set access 010 -> BOOT2     */
+#define T76_EMMC_PART_RPMB	  0x01B30300 /* set access 011 -> RPMB      */
+
 /* Firmware */
 #define T76_UPDATE_FILE_VERS_MASK 0xffff0000
 #define T76_FIRMWARE_VERS_MASK	  0x0000ffff
@@ -227,6 +246,38 @@ static int t76_adapter_init(minipro_handle_t *handle)
 	return EXIT_SUCCESS;
 }
 
+/* eMMC socket-adapter power/init at session start, byte-exact from XGPro's eMMC
+ * READ capture (pcaps/xgpro-3 frames 37-50): 0x24 f0 power-down (recv 8), 0x24 e0
+ * init (12 bytes, recv 0x28), 0x24 f1 power-up, then ONE 0x3e pin-detect (recv
+ * 0x20). This is what enables the EXT_CSD (0x08) read to return data; minipro's
+ * lighter read path (no adapter init) works for 0x0d streaming but the 0x08
+ * register read needs the adapter powered/selected. NOTE: byte[8] of the 0x24 e0
+ * command is 0x00 in the read capture (0x20 in the program capture xgpro-4 — a
+ * don't-care for the read/EXT_CSD path). */
+static int t76_emmc_adapter_init(minipro_handle_t *handle)
+{
+	static const uint8_t pwr_down[8]  = { 0x24, 0xf0, 0x08, 0x00,
+					      0x01, 0x00, 0x00, 0x00 };
+	static const uint8_t e0_init[12]  = { 0x24, 0xe0, 0x28, 0x00, 0x00, 0x00,
+					      0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+	static const uint8_t pwr_up[8]    = { 0x24, 0xf1, 0x00, 0x00,
+					      0x00, 0x00, 0x00, 0x00 };
+	uint8_t pd[16] = { 0 }, rsp[64];
+
+	if (t76_cmd_24(handle, pwr_down))
+		return EXIT_FAILURE;
+	if (msg_send(handle->usb_handle, (uint8_t *)e0_init, sizeof(e0_init)) ||
+	    msg_recv(handle->usb_handle, rsp, 0x28))
+		return EXIT_FAILURE;
+	if (t76_cmd_24(handle, pwr_up))
+		return EXIT_FAILURE;
+	pd[0] = T76_PIN_DETECTION;
+	if (msg_send(handle->usb_handle, pd, sizeof(pd)) ||
+	    msg_recv(handle->usb_handle, rsp, 32))
+		return EXIT_FAILURE;
+	return EXIT_SUCCESS;
+}
+
 static int t76_send_bitstream(minipro_handle_t *handle)
 {
 	/* Don't upload the bitstream again if we are in the same session */
@@ -243,6 +294,13 @@ static int t76_send_bitstream(minipro_handle_t *handle)
 		if (t76_adapter_init(handle))
 			return EXIT_FAILURE;
 	}
+	/* eMMC: do the adapter init only when auto-sizing from EXT_CSD (it's what
+	 * enables the 0x08 read). With a T76_EMMC_SIZE_MB override we keep the
+	 * lighter path that's already validated for read/program/erase. */
+	if (device->protocol_id == IC2_ALG_EMMC && !getenv("T76_EMMC_SIZE_MB")) {
+		if (t76_emmc_adapter_init(handle))
+			return EXIT_FAILURE;
+	}
 
 	if (get_algorithm(device, MP_T76, handle->cmdopts->algo_path,
 			  handle->cmdopts->icsp, handle->cmdopts->vopt))
@@ -255,6 +313,191 @@ static int t76_send_bitstream(minipro_handle_t *handle)
 	}
 
 	handle->bitstream_uploaded = 1;
+	return EXIT_SUCCESS;
+}
+
+/* ----------------------------------------------------------------------------
+ * eMMC (protocol_id 0x31) support — FIRST PASS, reverse-engineered from
+ * Xgpro_T76.exe V13.19, NOT yet hardware-validated.
+ *
+ * Unlike SPI/NOR/NAND (where the FPGA bitstream drives the memory bus and data
+ * moves over the 0x0D/0x10 block path), eMMC control commands (partition
+ * switch, status, ID) tunnel through opcode 0x27, while the bulk region data
+ * streams over the 0x0D (READ_CODE) path in 64 KiB blocks.
+ *
+ * The flow below is reconstructed byte-for-byte from a capture of XGPro reading
+ * a KLM8G1GEAC (pcaps/xgpro-3.pcapng), so it reflects what the device actually
+ * does rather than a static guess: BEGIN(0x31) -> 0x39 OVC (repacked header) ->
+ * 0x21/0x05/0x06 ID queries -> CMD6 SWITCH (0x27 op 0x46) -> per-region 0x27
+ * timing + 0x0D streaming read. See project_t76_emmc memory + t76-spec.md §5B.
+ * ------------------------------------------------------------------------- */
+
+/* 0x27 Form A: simple eMMC command, no payload. send 8 / recv 8.
+ *   msg[0]=0x27, msg[1]=op, msg[2..3]=0, msg[4..7]=ARG.
+ *   resp[1]=error (0=OK), resp[4..7]=R1/R1b (firmware checks &0xFFFF0000==0).
+ * Mirrors vendor t76_cmd_27_emmc_send_cmd @0x48d7d0. */
+static int t76_emmc_cmd27(minipro_handle_t *handle, uint8_t op, uint32_t arg,
+			  uint8_t resp[8])
+{
+	uint8_t msg[8] = { 0 };
+	uint8_t r[8] = { 0 };
+	msg[0] = T76_EMMC_SEND_CMD;
+	msg[1] = op;
+	format_int(&msg[4], arg, 4, MP_LITTLE_ENDIAN);
+	if (msg_send(handle->usb_handle, msg, 8) ||
+	    msg_recv(handle->usb_handle, r, sizeof(r)))
+		return EXIT_FAILURE;
+	if (resp)
+		memcpy(resp, r, 8);
+	if (r[1] != 0)
+		return EXIT_FAILURE;
+	return EXIT_SUCCESS;
+}
+
+/* Switch the active eMMC partition via CMD6 SWITCH (PARTITION_CONFIG). The host
+ * must switch to a partition before reading it. Confirmed in the XGPro capture
+ * (pcaps/xgpro-3.pcapng): 0x27 op 0x46, ARG = PARTITION_CONFIG. */
+int t76_emmc_switch_partition(minipro_handle_t *handle, uint32_t part_cfg)
+{
+	return t76_emmc_cmd27(handle, T76_EMMC_OP_SWITCH, part_cfg, NULL);
+}
+
+/* Per-region timing command (0x27 op00) that wraps every 0x0D read / 0x1F
+ * program. Two fixed variants from the capture (xgpro-3/xgpro-4): a PRE form
+ * sent before the read/program init and a POST form sent after the data.
+ *
+ * Byte [9] is the eMMC bus-width code (JEDEC BUS_WIDTH[183]: 0=1-bit, 1=4-bit,
+ * 2=8-bit) — the ONLY byte that differs by bus width (confirmed by diffing the
+ * 8-bit xgpro-3 vs the 4-bit xgpro-4bit-read captures). Derived from the chip
+ * profile's variant>>8 (0x51=1-bit, 0x54=4-bit, 0x53=8-bit). */
+static int t76_emmc_timing(minipro_handle_t *handle, int post)
+{
+	uint8_t pre[16] = { 0x27, 0x00, 0xff, 0x00, 0x3b, 0x0e, 0x05, 0x02,
+			    0x00, 0x02, 0xb7, 0x03, 0x00, 0x12, 0xb9, 0x03 };
+	uint8_t pst[16] = { 0x27, 0x00, 0xff, 0x00, 0x3b, 0x2c, 0x10, 0x0b,
+			    0x00, 0x02, 0xb7, 0x03, 0x00, 0x01, 0xb9, 0x03 };
+	uint8_t width;
+	switch ((uint8_t)(handle->device->variant >> 8)) {
+	case 0x51: width = 0; break; /* 1-bit */
+	case 0x54: width = 1; break; /* 4-bit */
+	case 0x53:
+	default:   width = 2; break; /* 8-bit */
+	}
+	pre[9] = width;
+	pst[9] = width;
+	return msg_send(handle->usb_handle, post ? pst : pre, 16);
+}
+
+/* Build the 40-byte 0x0D (read) / 0x1F (program) region init. The firmware
+ * then streams (read) / accepts (program) `blocks` x 64 KiB on EP82 / EP05.
+ * From the capture: [0]=opcode, [1]=01, [4..7]=start LBA (512-B sectors),
+ * [8..]=geometry constants, [16..19]=64 KiB-block count. */
+static void t76_emmc_io_init(uint8_t init[40], uint8_t opcode, uint32_t lba,
+			     uint32_t blocks)
+{
+	memset(init, 0, 40);
+	init[0] = opcode;
+	init[1] = 0x01;
+	format_int(&init[4], lba, 4, MP_LITTLE_ENDIAN);
+	format_int(&init[8], 0x200, 4, MP_LITTLE_ENDIAN);
+	format_int(&init[12], 0x20, 4, MP_LITTLE_ENDIAN);
+	format_int(&init[16], blocks, 4, MP_LITTLE_ENDIAN);
+	format_int(&init[20], 0x80, 4, MP_LITTLE_ENDIAN);
+	format_int(&init[24], 0x20, 4, MP_LITTLE_ENDIAN);
+	format_int(&init[28], 0x04, 4, MP_LITTLE_ENDIAN);
+	format_int(&init[32], 0x01, 4, MP_LITTLE_ENDIAN);
+}
+
+/* Resolve which eMMC partition to operate on. minipro has no eMMC-partition
+ * concept yet, so for the first pass the partition is selected by the
+ * T76_EMMC_PART env var (user/boot1/boot2/rpmb); default = user. */
+static uint32_t t76_emmc_target_partition(void)
+{
+	const char *p = getenv("T76_EMMC_PART");
+	if (p) {
+		if (!strcasecmp(p, "boot1"))
+			return T76_EMMC_PART_BOOT1;
+		if (!strcasecmp(p, "boot2"))
+			return T76_EMMC_PART_BOOT2;
+		if (!strcasecmp(p, "rpmb"))
+			return T76_EMMC_PART_RPMB;
+	}
+	return T76_EMMC_PART_USER;
+}
+
+/* eMMC session bring-up, run once after BEGIN_TRANS + the algorithm bitstream.
+ * Reconstructed byte-for-byte from a capture of XGPro reading a KLM8G1GEAC
+ * (pcaps/xgpro-3.pcapng): after BEGIN the vendor sends the 0x39 OVC poll (with
+ * the chip header repacked, handled in t76_get_ovc_status), then a short query
+ * sequence (0x21 device-ID/CID, 0x05 READID, 0x06), then a CMD6 SWITCH to the
+ * target partition. The bulk read then streams over 0x0D (see t76_read_block).
+ *
+ * NOTE: the earlier guesses (the 0x01/0xEF "io-mode" writes and the 0x27 op
+ * 0x00/0x01/0x02 register dance) were WRONG — the capture shows XGPro does
+ * neither for this part. The query replies (CID etc.) are drained, not matched.
+ * The 0x08/0x14/0x15 EXT_CSD/region reads the vendor also issues are omitted
+ * here (they return region-size info we don't yet consume). */
+static int t76_emmc_bring_up(minipro_handle_t *handle)
+{
+	static const uint8_t queries[][2] = {
+		{ 0x21, 32 }, /* device ID / CID blob */
+		{ 0x05, 32 }, /* READID (CID ascii) */
+		{ 0x06, 24 }, /* read user-id/status */
+	};
+	for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); i++) {
+		uint8_t cmd[8] = { 0 }, rsp[64];
+		cmd[0] = queries[i][0];
+		if (msg_send(handle->usb_handle, cmd, 8) ||
+		    msg_recv(handle->usb_handle, rsp, queries[i][1]))
+			return EXIT_FAILURE;
+	}
+
+	/* Capacity, per partition. With a T76_EMMC_SIZE_MB override, use it (MiB)
+	 * and skip the on-device read. Otherwise read EXT_CSD via opcode 0x08
+	 * (enabled by the adapter init in t76_send_bitstream): the 512-byte reply is
+	 * an 8-byte header + EXT_CSD, so EXT_CSD[N] is at buf[8+N]. Sizes:
+	 *   USER    = SEC_COUNT[212]      * 512
+	 *   BOOT1/2 = BOOT_SIZE_MULT[226] * 128 KiB
+	 *   RPMB    = RPMB_SIZE_MULT[168] * 128 KiB
+	 * (KLM8G1GEAC: SEC_COUNT 0x00e90000 = 7.28 GiB, BOOT_SIZE_MULT 0x20 = 4 MiB.) */
+	{
+		const char *sz = getenv("T76_EMMC_SIZE_MB");
+		uint32_t target = t76_emmc_target_partition();
+		if (sz) {
+			uint64_t mb = strtoull(sz, NULL, 10);
+			handle->emmc_capacity = (mb ? mb : 4) * 1024 * 1024;
+		} else {
+			uint8_t cmd[8] = { 0x08, 0x48, 0x00, 0x02, 0, 0, 0, 0 };
+			/* The device returns exactly 520 bytes (a 512-byte full
+			 * packet + an 8-byte short packet). Request 520 so the
+			 * short packet terminates the transfer at the exact length
+			 * — requesting 512 overflows (the 8 won't fit) and 1024
+			 * over-waits. Everything we read is within the first 512. */
+			uint8_t ext[520] = { 0 };
+			if (msg_send(handle->usb_handle, cmd, 8) ||
+			    read_payload(handle->usb_handle, ext, sizeof(ext)))
+				return EXIT_FAILURE;
+			uint32_t sec = ext[220] | (ext[221] << 8) |
+				       (ext[222] << 16) | ((uint32_t)ext[223] << 24);
+			uint8_t boot_mult = ext[234]; /* EXT_CSD[226] */
+			uint8_t rpmb_mult = ext[176]; /* EXT_CSD[168] */
+			if (target == T76_EMMC_PART_BOOT1 ||
+			    target == T76_EMMC_PART_BOOT2)
+				handle->emmc_capacity =
+					(uint64_t)boot_mult * 128 * 1024;
+			else if (target == T76_EMMC_PART_RPMB)
+				handle->emmc_capacity =
+					(uint64_t)rpmb_mult * 128 * 1024;
+			else if (sec)
+				handle->emmc_capacity = (uint64_t)sec * 512;
+			fprintf(stderr, "eMMC capacity: %llu MiB (EXT_CSD)\n",
+				(unsigned long long)(handle->emmc_capacity >> 20));
+		}
+	}
+
+	/* Select the partition to read (default USER; T76_EMMC_PART overrides). */
+	if (t76_emmc_switch_partition(handle, t76_emmc_target_partition()))
+		return EXIT_FAILURE;
 	return EXIT_SUCCESS;
 }
 
@@ -507,6 +750,24 @@ int t76_begin_transaction(minipro_handle_t *handle)
 			}
 		}
 
+		/* eMMC (protocol_id 0x31): the vendor sends a 128-byte BEGIN_TRANS
+		 * with NO 0x02 prelude and NO 0x40..0x7f chip-class packer
+		 * (confirmed in t76_begin_transaction_full — chip_type 0x31 has no
+		 * packer case). The eMMC-specific header bytes the vendor adds
+		 * (from the chip-load globals data_753a08/0c/14) are not yet mapped
+		 * to minipro device_t fields; the common header packed above plus
+		 * the 128-byte length is the first-pass approximation. The FPGA
+		 * eMMC host controller is configured separately by the bring-up
+		 * below, not by a BEGIN extension.
+		 * From the capture, msg[0x0c] carries the bus-mode/CSD byte
+		 * (0x53 for 8-bit, =variant>>8); minipro otherwise leaves it 0.
+		 * TODO(capture): confirm the remaining eMMC header deltas
+		 * (msg[0x12/0x18/0x20]) are/aren't load-bearing for the read. */
+		if (device->protocol_id == IC2_ALG_EMMC) {
+			msg[0x0c] = (uint8_t)(device->variant >> 8);
+			msglen = 128;
+		}
+
 		if (msg_send(handle->usb_handle, msg, msglen))
 			return EXIT_FAILURE;
 	} else {
@@ -520,6 +781,16 @@ int t76_begin_transaction(minipro_handle_t *handle)
 	if (ovc) {
 		fprintf(stderr, "Overcurrent protection!\007\n");
 		return EXIT_FAILURE;
+	}
+
+	/* eMMC needs the FPGA host controller brought up (IO mode + power-up +
+	 * partition select) before any block read/write. */
+	if (!handle->device->flags.custom_protocol &&
+	    handle->device->protocol_id == IC2_ALG_EMMC) {
+		if (t76_emmc_bring_up(handle)) {
+			fprintf(stderr, "eMMC bring-up failed.\n");
+			return EXIT_FAILURE;
+		}
 	}
 
 	return EXIT_SUCCESS;
@@ -579,6 +850,36 @@ int t76_read_block(minipro_handle_t *handle, data_set_t *ds)
 		memcpy(&msg[4], nand_read_hdr, sizeof(nand_read_hdr));
 		if (msg_send(handle->usb_handle, msg, 16))
 			return EXIT_FAILURE;
+		return read_payload(handle->usb_handle, ds->data, ds->size);
+	}
+
+	/* eMMC read (protocol_id 0x31). Reverse-engineered byte-for-byte from a
+	 * capture of XGPro reading a KLM8G1GEAC (pcaps/xgpro-3.pcapng). The vendor
+	 * reads a whole region with a SINGLE opcode-0x0D (READ_CODE) "init": the
+	 * firmware then streams the entire region as back-to-back 64 KiB (0x10000)
+	 * blocks on EP82. Each 0x0D is preceded by a fixed 0x27/op00 "timing"
+	 * command. The 0x0D init (40 bytes) carries the start LBA (512-byte
+	 * sectors) at [4..7] and the 64 KiB-block count at [16..19]; the other
+	 * fields are geometry constants replayed from the capture
+	 * (0x200 sector, 0x20, 0x80, 0x20, mode 0x04, 0x01).
+	 *
+	 * read_page_ram feeds one 64 KiB block per call with ds->size = 0x10000,
+	 * ds->block_count = region/0x10000, so we send the timing + 0x0D init once
+	 * (ds->init) with LBA = ds->address/512 and count = ds->block_count, then
+	 * drain one 64 KiB block per call. */
+	if (handle->device->protocol_id == IC2_ALG_EMMC && ds->type == MP_CODE) {
+		if (ds->init) {
+			uint8_t init[40];
+			if (t76_emmc_timing(handle, 0)) /* PRE-read */
+				return EXIT_FAILURE;
+			/* ds->address is the start LBA (sectors); read_page_ram
+			 * sets it as a sector index so it fits uint32 even for
+			 * multi-GiB parts. */
+			t76_emmc_io_init(init, T76_READ_CODE,
+					 ds->address, ds->block_count);
+			if (msg_send(handle->usb_handle, init, sizeof(init)))
+				return EXIT_FAILURE;
+		}
 		return read_payload(handle->usb_handle, ds->data, ds->size);
 	}
 
@@ -655,6 +956,59 @@ int t76_write_block(minipro_handle_t *handle, data_set_t *ds)
 	if (handle->device->flags.custom_protocol) {
 		return bb_write_block(handle, ds->type, ds->address, ds->data,
 				      ds->size);
+	}
+
+	/* eMMC program (protocol_id 0x31). Reverse-engineered from a capture of
+	 * XGPro programming a KLM8G1GEAC (pcaps/xgpro-4.pcapng). It mirrors the
+	 * 0x0D read but with opcode 0x1F and the data streamed OUT on EP05:
+	 *   once:        0x27 op0x50 (program setup, ARG 0x20000)
+	 *   per region:  0x27 PRE-timing -> 0x1F init (40B, start LBA + 64KiB
+	 *                block count) -> EP05 x (count) 64KiB blocks -> 0x39
+	 *                commit -> 0x27 POST-timing -> 0x39.
+	 * write_page_ram feeds one 64 KiB block per call (ds->size = 0x10000),
+	 * so we emit the setup+init on ds->init and the commit after the last
+	 * block (tracked by a per-write block counter). The partition was already
+	 * selected by the session bring-up (t76_emmc_bring_up). */
+	if (handle->device->protocol_id == IC2_ALG_EMMC && ds->type == MP_CODE) {
+		static uint32_t blk_idx, blk_total;
+		if (ds->init) {
+			uint8_t init[40], op50[8] = { 0 };
+			/* 0x27 op 0x50 program-setup (ARG 0x20000), once. */
+			op50[0] = T76_EMMC_SEND_CMD;
+			op50[1] = 0x50;
+			format_int(&op50[4], 0x00020000, 4, MP_LITTLE_ENDIAN);
+			if (msg_send(handle->usb_handle, op50, 8) ||
+			    msg_recv(handle->usb_handle, init, 8))
+				return EXIT_FAILURE;
+			if (t76_emmc_timing(handle, 0)) /* PRE */
+				return EXIT_FAILURE;
+			t76_emmc_io_init(init, T76_NAND_PROGRAM /* 0x1F */,
+					 ds->address, ds->block_count);
+			if (msg_send(handle->usb_handle, init, sizeof(init)))
+				return EXIT_FAILURE;
+			blk_idx = 0;
+			blk_total = ds->block_count;
+		}
+
+		if (write_payload(handle->usb_handle, ds->data, ds->size))
+			return EXIT_FAILURE;
+
+		if (++blk_idx >= blk_total) {
+			/* Commit: 0x39 -> POST-timing -> 0x39. */
+			uint8_t st[32] = { 0 };
+			st[0] = T76_REQUEST_STATUS;
+			if (msg_send(handle->usb_handle, st, 8) ||
+			    msg_recv(handle->usb_handle, st, sizeof(st)))
+				return EXIT_FAILURE;
+			if (t76_emmc_timing(handle, 1)) /* POST */
+				return EXIT_FAILURE;
+			memset(st, 0, sizeof(st));
+			st[0] = T76_REQUEST_STATUS;
+			if (msg_send(handle->usb_handle, st, 8) ||
+			    msg_recv(handle->usb_handle, st, sizeof(st)))
+				return EXIT_FAILURE;
+		}
+		return EXIT_SUCCESS;
 	}
 
 	/* NAND program (protocol_id 0x2d). The vendor T76 path (sub_4cf2c0)
@@ -1002,6 +1356,63 @@ static int t76_nand_erase(minipro_handle_t *handle)
 	return EXIT_SUCCESS;
 }
 
+/* eMMC erase (protocol_id 0x31). Reverse-engineered from a capture of XGPro
+ * erasing a KLM8G1GEAC (pcaps/xgpro-4.pcapng): the vendor issues a per-group
+ * ERASE (opcode 0x0E, 16 bytes) with the start LBA at msg[4..7] and the end
+ * LBA at msg[8..11], stepping the start by an erase group of 0x20000 sectors,
+ * and polls a status command (0x27 op 0x4D) between groups until the card
+ * returns to ready (resp[5] == 0x09; 0x0E means erase-in-progress).
+ *
+ * The partition was already selected by the session bring-up. The range erased
+ * is device->code_memory_size (the first-pass read/program cap). */
+static int t76_emmc_erase(minipro_handle_t *handle)
+{
+	device_t *device = handle->device;
+	const uint8_t poll[8] = { 0x27, 0x4d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00 };
+	uint8_t cmd[16], rsp[32];
+	/* sectors: prefer the EXT_CSD capacity (full device) over the uint32
+	 * code_memory_size, which can't hold a multi-GiB part. */
+	uint64_t total = handle->emmc_capacity ?
+				 handle->emmc_capacity / 512 :
+				 (uint64_t)device->code_memory_size / 512;
+
+	if (!total)
+		return EXIT_SUCCESS;
+
+	for (uint64_t start = 0; start < total; start += 0x20000) {
+		uint64_t end = start + 0x1ffff;
+		if (end >= total)
+			end = total - 1;
+
+		memset(cmd, 0, sizeof(cmd));
+		cmd[0] = T76_ERASE; /* 0x0E */
+		format_int(&cmd[4], (uint32_t)start, 4, MP_LITTLE_ENDIAN);
+		format_int(&cmd[8], (uint32_t)end, 4, MP_LITTLE_ENDIAN);
+		if (msg_send(handle->usb_handle, cmd, 16) ||
+		    msg_recv(handle->usb_handle, rsp, 8))
+			return EXIT_FAILURE;
+
+		/* Poll until the erase completes (resp[5] back to 0x09). */
+		int done = 0;
+		for (int i = 0; i < 2000000; i++) {
+			uint8_t p[8];
+			memcpy(p, poll, 8);
+			if (msg_send(handle->usb_handle, p, 8) ||
+			    msg_recv(handle->usb_handle, rsp, 8))
+				return EXIT_FAILURE;
+			if (rsp[5] != 0x0e) { /* not busy */
+				done = 1;
+				break;
+			}
+		}
+		if (!done) {
+			fprintf(stderr, "eMMC erase timed out.\n");
+			return EXIT_FAILURE;
+		}
+	}
+	return EXIT_SUCCESS;
+}
+
 int t76_erase(minipro_handle_t *handle, uint8_t num_fuses, uint8_t pld)
 {
 	if (handle->device->flags.custom_protocol) {
@@ -1010,6 +1421,9 @@ int t76_erase(minipro_handle_t *handle, uint8_t num_fuses, uint8_t pld)
 
 	if (handle->device->protocol_id == IC2_ALG_NAND)
 		return t76_nand_erase(handle);
+
+	if (handle->device->protocol_id == IC2_ALG_EMMC)
+		return t76_emmc_erase(handle);
 
 	uint8_t msg[64] = { 0 };
 	msg[0] = T76_ERASE;
@@ -1033,7 +1447,8 @@ int t76_get_ovc_status(minipro_handle_t *handle, minipro_status_t *status,
 	 * (e.g. 39 2d 00 00 06 00 a0 70). A zeroed 0x39 appears to leave the
 	 * NAND deselected so the following READID/read returns 0xFF. Mirror the
 	 * vendor by repacking the same header for NAND. */
-	if (handle->device->protocol_id == IC2_ALG_NAND) {
+	if (handle->device->protocol_id == IC2_ALG_NAND ||
+	    handle->device->protocol_id == IC2_ALG_EMMC) {
 		device_t *device = handle->device;
 		msg[1] = device->protocol_id;
 		msg[2] = (uint8_t)device->variant;
