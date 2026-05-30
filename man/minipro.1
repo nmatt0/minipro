@@ -77,6 +77,15 @@ or
 on some devices like Atmel AT89S8253.  Use
 .B \-c user
 to read or write this page.  See NOTES ON MEMORY TYPES below.
+.TP
+.B \-\-partition <name>
+Select the eMMC hardware partition to read/program/erase (T76 only).
+.br
+Possible values: user (default), boot1, boot2, rpmb.
+.br
+The device capacity is auto-detected per partition from EXT_CSD
+(user = SEC_COUNT, boot1/boot2 = BOOT_SIZE_MULT, rpmb = RPMB_SIZE_MULT).
+RPMB writes require authentication and are not supported.
 
 .TP
 .B \-f, \-\-format <format>

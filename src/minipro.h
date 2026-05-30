@@ -301,6 +301,13 @@ typedef struct cmdopts_s {
 		V_1V8 = 0,
 		V_3V3
 	} vopt;
+	/* T76 eMMC partition target (--partition). Default USER. */
+	enum {
+		EMMC_USER = 0,
+		EMMC_BOOT1,
+		EMMC_BOOT2,
+		EMMC_RPMB
+	} emmc_partition;
 	uint8_t no_erase;
 	uint8_t protect_off;
 	uint8_t protect_on;

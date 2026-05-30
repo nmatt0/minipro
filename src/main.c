@@ -99,6 +99,7 @@ static struct option long_options[] = {
 	{ "unprotect", no_argument, NULL, 'u' },
 	{ "hardware_check", no_argument, NULL, 't' },
 	{ "update", required_argument, NULL, 'F' },
+	{ "partition", required_argument, NULL, 7 },
 	{ "help", no_argument, NULL, 'h' },
 	{ NULL, 0, NULL, 0 }
 };
@@ -790,6 +791,23 @@ void parse_cmdline(int argc, char **argv, cmdopts_t *cmdopts)
 			break;
 		case 6:
 			cmdopts->algo_path = optarg; /* Custom algorithm.xml */
+			break;
+		case 7: /* --partition (T76 eMMC): user/boot1/boot2/rpmb */
+			if (!strcasecmp(optarg, "user"))
+				cmdopts->emmc_partition = EMMC_USER;
+			else if (!strcasecmp(optarg, "boot1"))
+				cmdopts->emmc_partition = EMMC_BOOT1;
+			else if (!strcasecmp(optarg, "boot2"))
+				cmdopts->emmc_partition = EMMC_BOOT2;
+			else if (!strcasecmp(optarg, "rpmb"))
+				cmdopts->emmc_partition = EMMC_RPMB;
+			else {
+				fprintf(stderr,
+					"Invalid eMMC partition '%s' "
+					"(use user/boot1/boot2/rpmb)\n",
+					optarg);
+				print_help_and_exit(argv[0]);
+			}
 			break;
 		case 'q':
 			if (!strcasecmp(optarg, "tl866a"))

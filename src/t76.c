@@ -408,21 +408,20 @@ static void t76_emmc_io_init(uint8_t init[40], uint8_t opcode, uint32_t lba,
 	format_int(&init[32], 0x01, 4, MP_LITTLE_ENDIAN);
 }
 
-/* Resolve which eMMC partition to operate on. minipro has no eMMC-partition
- * concept yet, so for the first pass the partition is selected by the
- * T76_EMMC_PART env var (user/boot1/boot2/rpmb); default = user. */
-static uint32_t t76_emmc_target_partition(void)
+/* Resolve which eMMC partition to operate on, from the --partition CLI option
+ * (cmdopts->emmc_partition; default USER). Returns the CMD6 PARTITION_CONFIG arg. */
+static uint32_t t76_emmc_target_partition(minipro_handle_t *handle)
 {
-	const char *p = getenv("T76_EMMC_PART");
-	if (p) {
-		if (!strcasecmp(p, "boot1"))
-			return T76_EMMC_PART_BOOT1;
-		if (!strcasecmp(p, "boot2"))
-			return T76_EMMC_PART_BOOT2;
-		if (!strcasecmp(p, "rpmb"))
-			return T76_EMMC_PART_RPMB;
+	switch (handle->cmdopts->emmc_partition) {
+	case EMMC_BOOT1:
+		return T76_EMMC_PART_BOOT1;
+	case EMMC_BOOT2:
+		return T76_EMMC_PART_BOOT2;
+	case EMMC_RPMB:
+		return T76_EMMC_PART_RPMB;
+	default:
+		return T76_EMMC_PART_USER;
 	}
-	return T76_EMMC_PART_USER;
 }
 
 /* eMMC session bring-up, run once after BEGIN_TRANS + the algorithm bitstream.
@@ -462,7 +461,7 @@ static int t76_emmc_bring_up(minipro_handle_t *handle)
 	 * (KLM8G1GEAC: SEC_COUNT 0x00e90000 = 7.28 GiB, BOOT_SIZE_MULT 0x20 = 4 MiB.) */
 	{
 		const char *sz = getenv("T76_EMMC_SIZE_MB");
-		uint32_t target = t76_emmc_target_partition();
+		uint32_t target = t76_emmc_target_partition(handle);
 		if (sz) {
 			uint64_t mb = strtoull(sz, NULL, 10);
 			handle->emmc_capacity = (mb ? mb : 4) * 1024 * 1024;
@@ -496,7 +495,7 @@ static int t76_emmc_bring_up(minipro_handle_t *handle)
 	}
 
 	/* Select the partition to read (default USER; T76_EMMC_PART overrides). */
-	if (t76_emmc_switch_partition(handle, t76_emmc_target_partition()))
+	if (t76_emmc_switch_partition(handle, t76_emmc_target_partition(handle)))
 		return EXIT_FAILURE;
 	return EXIT_SUCCESS;
 }
