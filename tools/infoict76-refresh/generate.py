@@ -116,6 +116,24 @@ if m_i2p:
         for nm in names.split(","):
             i2p_pinmap.setdefault(base_name(nm.strip()), hx(pm) & 0xff)
 
+# pinmap_model.json: a descriptor -> pin_map predictor learned from the
+# authoritative InfoIC2Plus database (see build_pinmap_model.py). Keyed on the
+# feature tuple (proto, desc[0x39]u16, desc[0x6c], desc[0x05], desc[0x04]);
+# value = [pin_map_low, agreement, n]. Leave-one-out 96.1% overall, 100% for
+# SPI/I2C/NAND/eMMC. Used when its agreement clears PINMAP_MODEL_MIN.
+PINMAP_MODEL_MIN = 0.95
+try:
+    pinmap_model = json.load(open("pinmap_model.json"))
+except Exception:
+    pinmap_model = {}
+def _model_feat(d):
+    return "%d:%d:%d:%d:%d" % (d[0x00], F.u(d, 0x39, 2), F.u(d, 0x6c, 4), d[0x05], d[0x04])
+def model_pinmap(d):
+    e = pinmap_model.get(_model_feat(d))
+    if e and e[1] >= PINMAP_MODEL_MIN:
+        return e[0], e[1]
+    return None, 0.0
+
 existing_bases = set()
 crib_pvk = defaultdict(Counter)   # (proto,variant,pkg) -> Counter(pin_map)
 crib_pv  = defaultdict(Counter)   # (proto,variant)
@@ -134,16 +152,20 @@ for b in re.findall(r"<ic\b(.*?)/>", t76, re.S):
         crib_pk[(p, k)][pm] += 1
         crib_p[p][pm] += 1
 
-CRIB_TIER = ["i2p", "pvk", "pv", "pk", "p"]
-def crib_pinmap(name, proto, var, pkg):
+CRIB_TIER = ["i2p", "model", "pvk", "pv", "pk", "p"]
+def crib_pinmap(name, d, proto, var, pkg):
     """Pick pin_map, authoritative source first.
-    Returns (pin_map, tier, confidence). tier 'i2p' = exact same chip in the
-    shared INFOIC2PLUS section (authoritative, confidence 1.0); the rest crib
-    from the closest T76 sibling with confidence = fraction of that tier
-    agreeing. pin_map drives only pin-test reporting, never read/write/erase."""
+    Returns (pin_map, tier, confidence):
+      'i2p'   = exact same chip in the shared INFOIC2PLUS section (conf 1.0);
+      'model' = the InfoIC2Plus-learned predictor (conf = its agreement);
+      pvk/pv/pk/p = crib from the closest T76 sibling (conf = tier agreement).
+    pin_map drives only pin-test reporting, never read/write/erase."""
     b = base_name(name)
     if b in i2p_pinmap:
         return i2p_pinmap[b], "i2p", 1.0
+    mv, mc = model_pinmap(d)
+    if mv is not None:
+        return mv, "model", mc
     for tier, c in (("pvk", crib_pvk[(proto, var, pkg)]), ("pv", crib_pv[(proto, var)]),
                     ("pk", crib_pk[(proto, pkg)]), ("p", crib_p[proto])):
         if c:
@@ -204,14 +226,14 @@ for mfr, proto, name, raw in chips:
     var = variant(d)
     if var is None or not has_bitstream(d):
         skip_variant += 1; continue
-    pin_map, tier, conf = crib_pinmap(name, d[0], var, pkg_token(name))
+    pin_map, tier, conf = crib_pinmap(name, d, d[0], var, pkg_token(name))
     if pin_map is None:                        # no sibling at all in this protocol
         skip_crib += 1; continue
-    # 'i2p' = authoritative same-chip value; otherwise the crib confidence
-    # (fraction of siblings agreeing) estimates how likely it matches the
-    # maintainer's. Flag the uncertain ones (<95% agree, or proto-only tier) for
-    # review. pin_map is pin-test-reporting only -- never affects read/write.
-    confident = tier == "i2p" or (conf >= 0.95 and tier != "p")
+    # 'i2p' = authoritative same-chip value; 'model' = InfoIC2Plus-learned
+    # predictor (>=95% agreement); otherwise the crib confidence. Flag the
+    # uncertain ones for review. pin_map is pin-test-reporting only -- never
+    # affects read/write.
+    confident = tier in ("i2p", "model") or (conf >= 0.95 and tier != "p")
     note = None
     if not confident:
         n_pin_review += 1

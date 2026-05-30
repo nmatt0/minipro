@@ -2,8 +2,9 @@
 
 > **Status:** the refresh has been **applied** to `infoic.xml` on branch
 > `t76-compat-improvements` (2028 new V13.19 chips added; existing entries
-> unchanged). Re-run `generate.py` to regenerate. Outstanding item: exact
-> `pin_map` for the 875 review-flagged chips (see Open problems).
+> unchanged). Re-run `generate.py` to regenerate. pin_map: 1773 confident
+> (incl. an InfoIC2Plus-learned model, 100% on SPI/I2C/NAND/eMMC), 255
+> review-flagged (mostly microwire/parallel).
 
 
 minipro's bundled `infoic.xml` T76 data is from **XGPro_T76 V12.91** (see the
@@ -97,28 +98,28 @@ base part name is absent are emitted as new `<ic>` entries:
 * **pin_map** -- minipro's low byte is the `<maps>` index, used **only by the
   pin-test command's host-side reporting** (the firmware does the actual
   detection via opcode `0x3E`); it is never used for read/write/erase.
-  **It is provably NOT derivable from the T76 descriptor:** W25Q64BV (proto 3)
-  and ACE24AC02 (proto 1) both have `desc[0x05]=0` (the vendor's pin-layout
-  selector feeding `sub_4d1c60`) yet use different pin_maps -- so that
-  insertion-test mask is not the maintainer's index source. pin_map is a
-  cross-programmer shared layout keyed by chip *identity*, living in XGecu's
-  other database (InfoIC2.dll for T48/T56), which is not shipped here. Sources,
-  best first:
+  **It is NOT a stored field** in any XGecu chip descriptor (proven for both
+  InfoICT76.dll and InfoIC2Plus.dll by correlation, and by counterexample:
+  W25Q64BV (proto 3) and ACE24AC02 (proto 1) share `desc[0x05]=0` -- the vendor's
+  pin-layout selector feeding `sub_4d1c60` -- yet use different pin_maps). It is
+  the host's per-chip socket pin-layout, a deterministic function of the chip's
+  package/pinout. Sources, best first:
   1. **i2p (authoritative)**: same chip in the shared INFOIC2PLUS section of
-     infoic.xml (verified 100% pin_map agreement on the 16792 chips present in
-     both sections). Covers new chips that already existed for the older
-     programmers.
-  2. **crib** from the closest T76 sibling: `(proto,variant,pkg)` ->
-     `(proto,variant)` -> `(proto,pkg)` -> `proto`, with a **confidence** =
-     fraction of that tier's siblings that agree.
+     infoic.xml (100% pin_map agreement on the 16792 chips in both sections).
+  2. **model**: a descriptor->pin_map predictor learned from the authoritative
+     **InfoIC2Plus.dll** (XGPro V13.16 T48/T56/TL866II+ database -- the same
+     family minipro's `<maps>` came from). See `build_pinmap_model.py` /
+     `pinmap_model.json`; keyed on `(proto, desc[0x39]u16, desc[0x6c], desc[0x05],
+     desc[0x04])`, used when its agreement >= 95%. **Leave-one-out 96.1% overall,
+     100% for SPI/I2C/NAND/eMMC** -- exactly where the flagged set concentrates.
+  3. **crib** from the closest T76 sibling: `(proto,variant,pkg)` ->
+     `(proto,variant)` -> `(proto,pkg)` -> `proto`, confidence = tier agreement.
 
   Each entry is emitted confident or flagged:
-  - **confident** (i2p, or agree >=95% and tier not proto-only): leave-one-out
-    accuracy **99.2-99.8%** (effectively exact).
-  - **flagged** (`<!-- pin_map cribbed tier=.. agree=..% ... verify -->`): ~55%
-    accurate; **99% of all crib errors land here**, so review these if you use
-    pin-test. Read/write is unaffected either way. Truly-exact values for the
-    flagged set require the V13.x InfoIC2.dll (T48/T56), not available here.
+  - **confident** (i2p; model >=95%; or crib agree >=95% and tier not proto-only):
+    effectively exact.
+  - **flagged** (`<!-- pin_map cribbed tier=.. agree=..% ... verify -->`):
+    review if you use pin-test. Read/write is unaffected either way.
 
 A new chip is emitted only if its variant is defined **and resolves to a `.alg`
 bitstream present in `algoT76/`** (a chip with no available bitstream cannot be
@@ -128,22 +129,19 @@ database (minipro's `-p` scans all `<ic>` by name regardless of manufacturer).
 
 Last run: 30172 chips preserved, **2028 new chips emitted** (all resolve to a
 real `.alg`), 92 skipped for lack of an available bitstream (e.g. the MW93ALG92
-SOT23-6 microwire family). pin_map: **1153 confident (99.8% accurate), 875
-flagged for review** (almost all proto 3/2/0x12 -- new variants and parallel
-wide packages). minipro parses the result (`-l` lists 34896 devices, +2088); the
+SOT23-6 microwire family). pin_map: **1773 confident (i2p=14, model=1431,
+crib=328), 255 flagged for review** (mostly microwire 0x02 / parallel 0x12).
+minipro parses the result (`-l` lists 34896 devices, +2088); the
 5 hardware-tested chips still resolve, as do newly-added parts (GD25LX64J,
 S-24C02D, S-93A46B, ...).
 
 ## Open problems (remaining work)
 
-1. **Exact `pin_map` for the 875 flagged chips** (pin-test reporting only; read/
-   write already correct). RE'd to a dead end *from this data*: pin_map is not a
-   function of the InfoICT76.dll descriptor (counterexample above). The
-   authoritative source is the **V13.x InfoIC2.dll** (the T48/T56 chip database)
-   -- the same new chips appear there with their shared pin_map. Obtaining and
-   extracting that DLL (same walker as `extract.py`) and matching by chip name
-   would resolve the flagged set exactly. The confidence flag already marks
-   precisely which entries need it.
+1. **`pin_map` for the 255 still-flagged chips** (pin-test reporting only; read/
+   write already correct). These are the microwire (0x02) / parallel (0x12)
+   protocols where the InfoIC2Plus model is ~90-93% rather than ~100%. A larger
+   InfoIC2Plus training corpus or the host's exact `(gnd,mask)` computation
+   matched to `<maps>` would close them. The confidence flag marks each one.
 2. **`voltages`** is `desc[0x4c]` at ~69% overall (82-97% for SPI/I2C/MW93) --
    could be refined further.
 3. **Microwire x16 caveat:** new 93Cxx parts get the x8 algo (0x11); x16 is a
@@ -156,8 +154,11 @@ S-24C02D, S-93A46B, ...).
 cp /path/to/InfoICT76.dll .
 python3 extract.py            # -> /tmp/v1319_chips.json
 python3 validate_variant.py   # audit variant.py vs ../../infoic.xml (I'm WRONG: 0)
+python3 build_pinmap_model.py /path/to/InfoIC2Plus.dll   # -> pinmap_model.json (committed)
 python3 generate.py           # -> infoic.refreshed.xml (merge; existing entries untouched)
 ```
 
+`pinmap_model.json` is committed, so `generate.py` runs without the InfoIC2Plus
+DLL; rebuild it only when refreshing against a newer T48/T56 database.
 `variant.py` / `fields.py` expose per-field functions taking the 0x74-byte
 descriptor (bytes); `generate.py` composes them.
