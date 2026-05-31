@@ -702,6 +702,53 @@ static int load_mem_device(db_data_t *db_data, const char *xml_device,
 	device->package_details.icsp = (package_details & ICSP_MASK) >> 8;
 	device->package_details.plcc = PIN_COUNT(package_details) > 0x30;
 
+	/* XGecu SPI-NAND geometry fix-up (T76 / T48 / T56 databases).
+	 *
+	 * XGecu's chip DB stores SPI-NAND geometry in a PACKED form that leaves
+	 * code_memory_size = 0.  minipro's NAND read then computes
+	 * block_count = code_memory_size / (write_buffer_size * pages_per_block)
+	 * = 0 and reads nothing (while parallel x8 NAND, which carries a real
+	 * code_memory_size, works fine).  The real geometry was recovered by
+	 * reverse-engineering the packing across Macronix / GigaDevice / Winbond
+	 * SPI-NAND of 1/2/4 Gbit:
+	 *   - the page_size field actually holds the BLOCK COUNT
+	 *     (e.g. 0x400 = 1024 blocks for a 1 Gbit part);
+	 *   - pages_per_block carries vendor flag bits in its top byte; the low
+	 *     24 bits are the real pages-per-block (typically 64);
+	 *   - write_buffer_size is the real page + spare (e.g. 0x840 = 2048 + 64).
+	 * So  code_memory_size = blocks * pages_per_block * (page + spare),  and
+	 * the real page size (needed for the NAND begin-transaction geometry) is
+	 * the largest power of two <= write_buffer_size.
+	 *
+	 * Verified: MX35LF1GE4AB 1024*64*0x840 = 0x8400000, MX35LF2GE4AB
+	 * 2048*64*0x840 = 0x10800000, MX35LF4G24AD 2048*64*0x1100 = 0x22000000 —
+	 * all match real code_memory_size values already present in the DB.
+	 *
+	 * The signature is deliberately tight (NAND + zero size + a flag bit in
+	 * the top byte of pages_per_block) so properly-sized parallel NAND and
+	 * every other device are left untouched.
+	 *
+	 * data_memory2_size is also a packed leftover here (it varies between
+	 * otherwise-identical parts) and minipro would otherwise treat it as a
+	 * spurious "user" memory section; clear it so the part takes the same
+	 * read path as the validated parallel NAND (which has it zero). */
+	if (version != INFOIC_DATABASE &&
+	    device->protocol_id == IC2_ALG_NAND &&
+	    device->code_memory_size == 0 &&
+	    (device->pages_per_block & 0xff000000)) {
+		uint32_t blocks = device->page_size;
+		uint32_t ppb = device->pages_per_block & 0x00ffffff;
+		uint32_t page_spare = device->write_buffer_size;
+		uint32_t real_page = 1;
+		while ((real_page << 1) <= page_spare)
+			real_page <<= 1;
+		device->code_memory_size =
+			(uint32_t)((uint64_t)blocks * ppb * page_spare);
+		device->pages_per_block = ppb;
+		device->page_size = real_page;
+		device->data_memory2_size = 0;
+	}
+
 	/* Fill some device parameters */
 	device->compare_mask = 0xff;
 	switch (device->chip_info) {
