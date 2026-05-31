@@ -684,15 +684,18 @@ int t76_begin_transaction(minipro_handle_t *handle)
 			msg[0x14] = 0x00;
 			msg[0x18] = 0x03;
 			msg[0x1c] = 0x03;
-			/* msg[0x28] is desc[0x6c] (the chip's pin/family dword).
-			 * 0xe2000000 is the W29N02GZ (parallel x8) value; the
-			 * 0xe2 high byte at [0x2b] is load-bearing for parallel
-			 * NAND but PREVENTS serial SPI-NAND bring-up (READID
-			 * returns 0x0000 — confirmed by a usbmon diff of XGPro
-			 * reading a GD5F1GM7UEYIG, which sends 0 there). Until
-			 * minipro carries desc[0x6c] per-chip, gate the parallel
-			 * value to parallel NAND (variant low nibble & 0x70 == 0)
-			 * and leave it zero for serial SPI-NAND. */
+			/* msg[0x28] is the chip's pin/family dword (desc[0x6c]). For
+			 * parallel x8 NAND, XGPro sends it verbatim with its top flag
+			 * bits set (W29N02GZ = 0xe2000000, hardware-validated); for
+			 * serial SPI-NAND, 0 is correct because the only load-bearing
+			 * byte is [0x2b] and 0 satisfies it (a parallel value's 0xe2
+			 * there blocks serial bring-up -> READID 0x0000).
+			 * package_details CANNOT reconstruct desc[0x6c]: it masks the
+			 * top flag bits of [0x2a], which ARE load-bearing (GD5F reads
+			 * with [0x2a] = 0x88 or 0x00 but NOT the flag-stripped 0x08).
+			 * Byte-exact [0x28] for every part would need raw desc[0x6c]
+			 * carried per chip; the 0 / 0xe2000000 split is correct for all
+			 * NAND tested so far (see PROGRESS.md s8). */
 			if ((device->variant & 0x70) == 0)
 				format_int(&msg[0x28], 0xe2000000, 4,
 					   MP_LITTLE_ENDIAN);
