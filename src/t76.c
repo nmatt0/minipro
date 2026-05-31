@@ -726,24 +726,49 @@ int t76_begin_transaction(minipro_handle_t *handle)
 			 * parts and source the clock from the bus-clock table. */
 			{
 				uint8_t pre[64] = { 0 };
-				uint16_t ps = (uint16_t)device->page_size;
+				/* device->page_size holds desc[0x54] = block count
+				 * for SPI-NAND (and == page for parallel NAND). The
+				 * REAL page (for [0x0a] + the page-size code) is
+				 * desc[0x50] = the largest power of two <=
+				 * write_buffer_size (page + spare). */
+				uint16_t page_or_blocks =
+					(uint16_t)device->page_size;
 				uint16_t ppb = device->pages_per_block;
-				uint32_t ps_code = (ps < 0x800)   ? 4 :
-						   (ps == 0x800)  ? 8 :
-						   (ps == 0x1000) ? 4 :
-						   (ps == 0x4000) ? 1 :
+				uint16_t wbuf = device->write_buffer_size;
+				uint16_t real_page = 1;
+				while ((uint32_t)(real_page << 1) <= wbuf)
+					real_page <<= 1;
+				uint32_t ps_code = (real_page < 0x800)   ? 4 :
+						   (real_page == 0x800)  ? 8 :
+						   (real_page == 0x1000) ? 4 :
+						   (real_page == 0x4000) ? 1 :
 								    2;
+				/* bus/width code (data_7a5ccc) and clock/adapter
+				 * table selection RE'd from t76_load_chip_to_state;
+				 * serial SPI-NAND (variant_low & 0x70 != 0) uses a
+				 * different clock table + adapter bit than parallel
+				 * NAND. All values reproduce the validated W29N02GZ
+				 * prelude exactly for the parallel case. */
+				uint32_t big = ((uint32_t)ppb *
+						page_or_blocks) > 0x10000;
+				uint32_t busw = (real_page >= 0x800) ?
+						(big ? 3 : 1) : (big ? 2 : 0);
+				int serial = (device->variant & 0x70) != 0;
+				uint32_t clock = serial ? 0x07071d2f : 0x27154f3b;
+				uint32_t adapter = serial ? 0x00010001 : 0x00010000;
 				pre[0] = T76_BEGIN_TRANS_LOGIC; /* 0x02 */
 				format_int(&pre[0x08], ppb, 2, MP_LITTLE_ENDIAN);
-				format_int(&pre[0x0a], ps, 2, MP_LITTLE_ENDIAN);
-				format_int(&pre[0x0c], ps, 2, MP_LITTLE_ENDIAN);
+				format_int(&pre[0x0a], real_page, 2,
+					   MP_LITTLE_ENDIAN);
+				format_int(&pre[0x0c], page_or_blocks, 2,
+					   MP_LITTLE_ENDIAN);
 				format_int(&pre[0x0e], ppb, 2, MP_LITTLE_ENDIAN);
 				format_int(&pre[0x10], 1, 2, MP_LITTLE_ENDIAN);
 				format_int(&pre[0x12], 1, 2, MP_LITTLE_ENDIAN);
-				format_int(&pre[0x14], 3, 4, MP_LITTLE_ENDIAN);
+				format_int(&pre[0x14], busw, 4, MP_LITTLE_ENDIAN);
 				format_int(&pre[0x18], ps_code, 4, MP_LITTLE_ENDIAN);
-				format_int(&pre[0x20], 0x00010000, 4, MP_LITTLE_ENDIAN);
-				format_int(&pre[0x24], 0x27154f3b, 4, MP_LITTLE_ENDIAN);
+				format_int(&pre[0x20], adapter, 4, MP_LITTLE_ENDIAN);
+				format_int(&pre[0x24], clock, 4, MP_LITTLE_ENDIAN);
 				if (msg_send(handle->usb_handle, pre, sizeof(pre)))
 					return EXIT_FAILURE;
 			}
