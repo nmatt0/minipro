@@ -684,8 +684,18 @@ int t76_begin_transaction(minipro_handle_t *handle)
 			msg[0x14] = 0x00;
 			msg[0x18] = 0x03;
 			msg[0x1c] = 0x03;
-			format_int(&msg[0x28], 0xe2000000, 4,
-				   MP_LITTLE_ENDIAN);
+			/* msg[0x28] is desc[0x6c] (the chip's pin/family dword).
+			 * 0xe2000000 is the W29N02GZ (parallel x8) value; the
+			 * 0xe2 high byte at [0x2b] is load-bearing for parallel
+			 * NAND but PREVENTS serial SPI-NAND bring-up (READID
+			 * returns 0x0000 — confirmed by a usbmon diff of XGPro
+			 * reading a GD5F1GM7UEYIG, which sends 0 there). Until
+			 * minipro carries desc[0x6c] per-chip, gate the parallel
+			 * value to parallel NAND (variant low nibble & 0x70 == 0)
+			 * and leave it zero for serial SPI-NAND. */
+			if ((device->variant & 0x70) == 0)
+				format_int(&msg[0x28], 0xe2000000, 4,
+					   MP_LITTLE_ENDIAN);
 			msg[0x30] = 0x40;
 			msglen = 128;
 
@@ -754,10 +764,24 @@ int t76_begin_transaction(minipro_handle_t *handle)
 				uint32_t busw = (real_page >= 0x800) ?
 						(big ? 3 : 1) : (big ? 2 : 0);
 				int serial = (device->variant & 0x70) != 0;
-				uint32_t clock = serial ? 0x07071d2f : 0x27154f3b;
+				/* NAND bus clock = bus-clock-table[index]. The index
+				 * tracks the selected programming speed; the values
+				 * below are the conservative low-speed entries that XGPro
+				 * uses by default and that were captured driving these
+				 * parts reliably (serial table[0] for SPI-NAND, parallel
+				 * table[3] for the validated W29N02GZ). A faster but
+				 * connection-sensitive value can be forced via the
+				 * T76_NAND_CLOCK env override (e.g. serial table[4] =
+				 * 0x0805172f). */
+				uint32_t clock = serial ? 0x0808230e : 0x27154f3b;
 				uint32_t adapter = serial ? 0x00010001 : 0x00010000;
+				{
+					char *cl = getenv("T76_NAND_CLOCK");
+					if (cl) clock = (uint32_t)strtoul(cl, NULL, 0);
+				}
+				uint16_t spare = wbuf - real_page;
 				pre[0] = T76_BEGIN_TRANS_LOGIC; /* 0x02 */
-				format_int(&pre[0x08], ppb, 2, MP_LITTLE_ENDIAN);
+				format_int(&pre[0x08], spare, 2, MP_LITTLE_ENDIAN);
 				format_int(&pre[0x0a], real_page, 2,
 					   MP_LITTLE_ENDIAN);
 				format_int(&pre[0x0c], page_or_blocks, 2,
