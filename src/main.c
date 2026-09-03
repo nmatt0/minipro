@@ -46,6 +46,11 @@
 
 
 #define READ_BUFFER_SIZE 65536
+/* Above this device size, a raw (binary) read streams block-by-block to the
+ * file instead of buffering the whole image in RAM (see read_page_file). Keeps
+ * peak memory bounded on multi-GiB parts like eMMC; smaller parts keep the
+ * simpler full-buffer path so their behaviour is unchanged. */
+#define STREAM_THRESHOLD (256UL * 1024 * 1024)
 #define MIN(a, b)	 (((a) < (b)) ? (a) : (b))
 
 static const char *user_id[] = {
@@ -1317,7 +1322,7 @@ int compare_word_memory(uint16_t replacement_value, uint16_t compare_mask,
 
 /* RAM-centric IO operations */
 int read_page_ram(minipro_handle_t *handle, uint8_t *buffer, uint8_t type,
-		  size_t size)
+		  size_t size, FILE *stream)
 {
 	const char *name = (type == MP_DATA) ? "Data" :
 			   (type == MP_USER) ? "User" :
@@ -1361,6 +1366,20 @@ int read_page_ram(minipro_handle_t *handle, uint8_t *buffer, uint8_t type,
 				  handle->device->page_size :
 				  0;
 
+	/* Streaming mode (stream != NULL): keep only one block in RAM and write
+	 * each block straight to the file, so peak memory is O(block) instead of
+	 * O(device). Used for large raw reads such as eMMC (see read_page_file).
+	 * The caller's `buffer` is unused in this mode. */
+	uint8_t *stream_buf = NULL;
+	if (stream) {
+		stream_buf = malloc(ds.size);
+		if (!stream_buf) {
+			fprintf(stderr, "Out of memory\n");
+			return EXIT_FAILURE;
+		}
+		ds.data = stream_buf;
+	}
+
 	/* Initialize progress reporting */
 	progress_status("Reading %s...  ", -1, 0, name);
 
@@ -1381,10 +1400,27 @@ int read_page_ram(minipro_handle_t *handle, uint8_t *buffer, uint8_t type,
 		    handle->device->protocol_id == IC2_ALG_EMMC)
 			ds.address = (uint32_t)((uint64_t)i * (ds.size >> 9));
 
-		if (minipro_read_block(handle, &ds))
+		if (minipro_read_block(handle, &ds)) {
+			free(stream_buf);
 			return EXIT_FAILURE;
+		}
 
-		ds.data += ds.size;
+		if (stream) {
+			/* Write this block's valid bytes; the final block may be
+			 * short if size is not a multiple of the block size. */
+			size_t off = (size_t)i * ds.size;
+			size_t valid = (size - off < ds.size) ? size - off :
+								ds.size;
+			if (fwrite(stream_buf, 1, valid, stream) != valid) {
+				fprintf(stderr, "\nFile write error\n");
+				free(stream_buf);
+				return EXIT_FAILURE;
+			}
+			/* reuse the one-block scratch for the next block */
+			ds.data = stream_buf;
+		} else {
+			ds.data += ds.size;
+		}
 		ds.init = 0;
 
 		/* Report progress */
@@ -1393,11 +1429,14 @@ int read_page_ram(minipro_handle_t *handle, uint8_t *buffer, uint8_t type,
 		/* T76 doesn't support calling get_ovc_status while read/write */
 		if (handle->version != MP_T76) {
 			uint8_t ovc = 0;
-			if (minipro_get_ovc_status(handle, NULL, &ovc))
+			if (minipro_get_ovc_status(handle, NULL, &ovc)) {
+				free(stream_buf);
 				return EXIT_FAILURE;
+			}
 			if (ovc) {
 				fprintf(stderr,
 					"\nOvercurrent protection!\007\n");
+				free(stream_buf);
 				return EXIT_FAILURE;
 			}
 		}
@@ -1406,6 +1445,7 @@ int read_page_ram(minipro_handle_t *handle, uint8_t *buffer, uint8_t type,
 	/* Stop progress and print elapsed time */
 	progress_status(NULL, 0, 1);
 
+	free(stream_buf);
 	return EXIT_SUCCESS;
 }
 
@@ -2184,7 +2224,7 @@ int write_page_file(minipro_handle_t *handle, uint8_t type, size_t size)
 			free(file_data);
 			return EXIT_FAILURE;
 		}
-		if (read_page_ram(handle, chip_data, type, size)) {
+		if (read_page_ram(handle, chip_data, type, size, NULL)) {
 			free(file_data);
 			free(chip_data);
 			return EXIT_FAILURE;
@@ -2234,6 +2274,18 @@ int read_page_file(minipro_handle_t *handle, uint8_t type, size_t size)
 	if (!file)
 		return EXIT_FAILURE;
 
+	/* Large raw (binary) read: stream block-by-block straight to the file so
+	 * peak RAM is O(block), not O(device). A full-device buffer here would
+	 * pull, e.g., ~58 GiB into memory for a 64 GB eMMC and risk OOM / heavy
+	 * swap on the host. IHEX/SREC need the whole image in memory to emit, and
+	 * small devices are cheap to buffer, so both keep the full-buffer path
+	 * below; only a raw read past STREAM_THRESHOLD streams. */
+	if (handle->cmdopts->format == NO_FORMAT && size > STREAM_THRESHOLD) {
+		int ret = read_page_ram(handle, NULL, type, size, file);
+		fclose(file);
+		return ret;
+	}
+
 	/* There is an off by one bug in T56 firmware.
 	 * Allocate couple extra bytes to prevent buffer overflow.
 	 * We need only one byte but make it 16, we never know.
@@ -2246,7 +2298,7 @@ int read_page_file(minipro_handle_t *handle, uint8_t type, size_t size)
 	}
 
 	memset(buffer, handle->device->blank_value, size);
-	if (read_page_ram(handle, buffer, type, size)) {
+	if (read_page_ram(handle, buffer, type, size, NULL)) {
 		fclose(file);
 		free(buffer);
 		return EXIT_FAILURE;
@@ -2331,7 +2383,7 @@ int verify_page_file(minipro_handle_t *handle, uint8_t type, size_t size)
 		free(file_data);
 		return EXIT_FAILURE;
 	}
-	if (read_page_ram(handle, chip_data, type, size)) {
+	if (read_page_ram(handle, chip_data, type, size, NULL)) {
 		free(file_data);
 		free(chip_data);
 		return EXIT_FAILURE;
