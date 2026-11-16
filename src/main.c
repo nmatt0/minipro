@@ -1337,12 +1337,13 @@ int read_page_ram(minipro_handle_t *handle, uint8_t *buffer, uint8_t type,
 
 	ds.block_count = (size + ds.size - 1) / ds.size;
 
-	/* NAND (T76) is read one erase-block at a time (data + spare), so the
-	 * transfer unit is write_buffer_size * pages_per_block (e.g. 0x840 *
-	 * 0x40 = 0x21000), not the generic read_buffer_size. Each per-block
-	 * read command carries the block index; see t76_read_block. */
-	if (handle->version == MP_T76 && type == MP_CODE &&
-	    handle->device->protocol_id == IC2_ALG_NAND &&
+	/* NAND is read in erase-block units (data + spare). For the T76 the
+	 * unit is one block; for the TL866II+ write_buffer_size holds the
+	 * page-data+spare size, so the same expression is the per-command unit
+	 * (two blocks for the verified MT29F4G08ABAFAWP). The per-block read
+	 * command carries the unit index; see t76_read_block/tl866iiplus_read_block. */
+	if ((handle->version == MP_T76 || handle->version == MP_TL866IIPLUS) &&
+	    type == MP_CODE && handle->device->protocol_id == IC2_ALG_NAND &&
 	    handle->device->pages_per_block) {
 		ds.size = (size_t)handle->device->write_buffer_size *
 			  handle->device->pages_per_block;
@@ -1426,8 +1427,12 @@ int read_page_ram(minipro_handle_t *handle, uint8_t *buffer, uint8_t type,
 		/* Report progress */
 		progress_status(NULL, i * 100 / ds.block_count, 0);
 
-		/* T76 doesn't support calling get_ovc_status while read/write */
-		if (handle->version != MP_T76) {
+		/* T76 doesn't support calling get_ovc_status while read/write.
+		 * The TL866II+ NAND stream is likewise left alone: the vendor
+		 * does not poll status between block commands. */
+		if (handle->version != MP_T76 &&
+		    !(handle->version == MP_TL866IIPLUS && type == MP_CODE &&
+		      handle->device->protocol_id == IC2_ALG_NAND)) {
 			uint8_t ovc = 0;
 			if (minipro_get_ovc_status(handle, NULL, &ovc)) {
 				free(stream_buf);
@@ -2993,6 +2998,23 @@ static size_t t76_code_size(minipro_handle_t *handle)
 	if (handle->version == MP_T76 &&
 	    handle->device->protocol_id == IC2_ALG_EMMC && handle->emmc_capacity)
 		return (size_t)handle->emmc_capacity;
+	/* The TL866II+ NAND entry in infoic.xml carries a code_memory_size that
+	 * does not match the raw stream the chip returns or the vendor's own
+	 * total: Xgpro recomputes it (Xgpro.exe sub_4EDAA0) as
+	 * write_buffer_size * pages_per_block * page_size, which is 0x22000000
+	 * (544 MiB) for the verified MT29F4G08ABAFAWP where the database says
+	 * 0x21000000 (528 MiB). Use the vendor value so the dump matches the
+	 * vendor's byte for byte. The vendor also multiplies by a per-part
+	 * die/plane byte (1 on every part seen so far), which the database does
+	 * not expose. */
+	if (handle->version == MP_TL866IIPLUS &&
+	    handle->device->protocol_id == IC2_ALG_NAND) {
+		uint64_t total = (uint64_t)handle->device->write_buffer_size *
+				 handle->device->pages_per_block *
+				 handle->device->page_size;
+		if (total)
+			return (size_t)total;
+	}
 	return handle->device->code_memory_size;
 }
 
@@ -3121,10 +3143,15 @@ int action_read(minipro_handle_t *handle)
 		}
 	}
 
+	/* NAND has no separate "user" area. The database carries a packed
+	 * leftover in data_memory2_size (0x20030 for MT29F4G08ABAFAWP), which
+	 * would otherwise trigger an unsupported READ_USER_DATA after the code
+	 * read and block until the long USB timeout. */
 	if ((handle->cmdopts->page == USER ||
 	     (handle->cmdopts->page == UNSPECIFIED &&
 	      !handle->cmdopts->is_pipe)) &&
-	    handle->device->data_memory2_size) {
+	    handle->device->data_memory2_size &&
+	    handle->device->protocol_id != IC2_ALG_NAND) {
 		handle->cmdopts->filename = user_filename;
 		if (read_page_file(handle, MP_USER,
 				   handle->device->data_memory2_size)) {
@@ -3461,6 +3488,7 @@ int action_verify(minipro_handle_t *handle)
 		/* Verifying user memory section.
 		 * If filename is null then a blank check is performed. */
 		if (handle->device->data_memory2_size &&
+		    handle->device->protocol_id != IC2_ALG_NAND &&
 		    (handle->cmdopts->page == USER ||
 		     (handle->cmdopts->page == UNSPECIFIED &&
 		      !handle->cmdopts->filename))) {
