@@ -214,6 +214,86 @@ enum GND_PINS
 };
 
 /* clang-format on */
+
+/* TL866II+ NAND setup, decoded from Xgpro's own transaction builder
+ * (Xgpro.exe sub_444BC0 @ 0x444bc0). When the protocol id is NAND (0x2D) that
+ * function closes the current transaction, sends a 64-byte 0x02 packet and
+ * then the usual 0x03 BEGIN_TRANS. minipro defined TL866IIPLUS_NAND_INIT but
+ * never sent it, so the firmware stayed in the generic path and a READ_CODE
+ * carrying a block count streamed until the USB transfer timed out.
+ *
+ * The packet is built from the chip database exactly as the vendor does:
+ *
+ *   [8..9]   spare bytes in the write buffer      pulse_delay low word
+ *   [10..11] page-data bytes in the buffer        write_buffer_size - spare
+ *   [12..13] page size
+ *   [14..15] pages per block
+ *   [16..19] die/plane flags                      0x00010001 on verified parts
+ *   [20..23] geometry class                       3 for 2 KiB pages/64 ppb
+ *   [24..27] read_buffer_size / write_buffer_size
+ *   [28..31] high bit of the variant byte
+ *   [32..35] timing flags                         0 on the verified parts
+ *   [36..39] NAND timing word for clock index 0   Xgpro table @ 0x6a2348
+ *   [40..63] unused, zero
+ *
+ * The class/timing words were confirmed against captures of two different
+ * Micron parts; they are constants for this geometry family rather than
+ * fields the database carries. */
+static int tl866iiplus_nand_init(minipro_handle_t *handle)
+{
+	device_t *device = handle->device;
+	uint16_t wbs = device->write_buffer_size;
+	uint16_t spare = (uint16_t)(device->pulse_delay & 0xffff);
+	uint16_t data = (uint16_t)(wbs - spare);
+	uint32_t units;
+	uint32_t class;
+	uint8_t msg[64] = { 0 };
+	uint8_t end[8] = { TL866IIPLUS_END_TRANS };
+
+	if (!wbs || !device->page_size || !device->pages_per_block ||
+	    !device->read_buffer_size || spare > wbs) {
+		fprintf(stderr, "NAND: unusable chip geometry\n");
+		return EXIT_FAILURE;
+	}
+	units = device->read_buffer_size / wbs;
+	if (!units)
+		units = 1;
+
+	class = ((uint64_t)device->pages_per_block * device->page_size >
+		 0x10000) ?
+			3 :
+			1;
+	if (data < 0x800)
+		class--;
+
+	msg[0] = TL866IIPLUS_NAND_INIT;
+	format_int(&msg[8], spare, 2, MP_LITTLE_ENDIAN);
+	format_int(&msg[10], data, 2, MP_LITTLE_ENDIAN);
+	format_int(&msg[12], device->page_size, 2, MP_LITTLE_ENDIAN);
+	format_int(&msg[14], device->pages_per_block, 2, MP_LITTLE_ENDIAN);
+	format_int(&msg[16], 0x00010001, 4, MP_LITTLE_ENDIAN);
+	format_int(&msg[20], class, 4, MP_LITTLE_ENDIAN);
+	format_int(&msg[24], units, 4, MP_LITTLE_ENDIAN);
+	format_int(&msg[28], (device->variant & 0x80) ? 1 : 0, 4,
+		   MP_LITTLE_ENDIAN);
+	format_int(&msg[36], 0x27254f13, 4, MP_LITTLE_ENDIAN);
+
+	/* The vendor closes the previous transaction before the NAND init. */
+	if (msg_send(handle->usb_handle, end, sizeof(end)))
+		return EXIT_FAILURE;
+	return msg_send(handle->usb_handle, msg, sizeof(msg));
+}
+
+/* Bytes one READ_CODE returns: write_buffer_size * pages_per_block, i.e. one
+ * erase block of page data plus spare (the database packs the write buffer as
+ * data + spare, unlike the T76 database which stores page+spare directly). */
+static uint32_t tl866iiplus_nand_unit_size(device_t *device)
+{
+	if (!device->write_buffer_size || !device->pages_per_block)
+		return 0;
+	return (uint32_t)device->write_buffer_size * device->pages_per_block;
+}
+
 int tl866iiplus_begin_transaction(minipro_handle_t *handle)
 {
 	uint8_t msg[64];
@@ -261,6 +341,9 @@ int tl866iiplus_begin_transaction(minipro_handle_t *handle)
 		format_int(&(msg[56]), handle->device->flags.raw_flags, 4,
 			   MP_LITTLE_ENDIAN);
 
+		if (device->protocol_id == IC2_ALG_NAND &&
+		    tl866iiplus_nand_init(handle))
+			return EXIT_FAILURE;
 		if (msg_send(handle->usb_handle, msg, sizeof(msg)))
 			return EXIT_FAILURE;
 	} else {
@@ -293,6 +376,42 @@ int tl866iiplus_read_block(minipro_handle_t *handle, data_set_t *ds)
 	if (handle->device->flags.custom_protocol) {
 		return bb_read_block(handle, ds->type, ds->address, ds->data,
 				     ds->size);
+	}
+
+	/* NAND is read in firmware-sized units, not bytes. Xgpro's read helper
+	 * (Xgpro.exe sub_4D4E80) sends a 16-byte READ_CODE with
+	 *   [2..3]  read_buffer_size / write_buffer_size
+	 *   [4..7]  unit index
+	 *   [8..9]  bytes to read from EP82 per chunk
+	 *   [10..11] bytes to read from EP83 per chunk
+	 * and the firmware streams one unit (write_buffer_size *
+	 * pages_per_block bytes) per command. The byte-addressed 8-byte command
+	 * the generic path sends is what made the old read time out. */
+	if (handle->device->protocol_id == IC2_ALG_NAND && ds->type == MP_CODE) {
+		uint32_t unit = tl866iiplus_nand_unit_size(handle->device);
+		uint32_t units = handle->device->write_buffer_size ?
+					 handle->device->read_buffer_size /
+						 handle->device->write_buffer_size :
+					 0;
+		uint8_t msg[16] = { 0 };
+
+		if (!unit || !units || !handle->device->read_buffer_size % 2 ||
+		    ds->size % unit) {
+			fprintf(stderr, "NAND: unusable read geometry\\n");
+			return EXIT_FAILURE;
+		}
+
+		msg[0] = TL866IIPLUS_READ_CODE;
+		format_int(&(msg[2]), units, 2, MP_LITTLE_ENDIAN);
+		format_int(&(msg[4]), ds->address / unit, 4,
+			   MP_LITTLE_ENDIAN);
+		format_int(&(msg[8]), handle->device->read_buffer_size / 2, 2,
+			   MP_LITTLE_ENDIAN);
+		format_int(&(msg[10]), handle->device->read_buffer_size / 2, 2,
+			   MP_LITTLE_ENDIAN);
+		if (msg_send(handle->usb_handle, msg, sizeof(msg)))
+			return EXIT_FAILURE;
+		return read_payload(handle->usb_handle, ds->data, ds->size);
 	}
 
 	uint8_t msg[64] = {0};
